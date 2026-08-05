@@ -99,6 +99,7 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         || matches!(segments, [0x5f00, ..])
         || segments[0] & 0xfe00 == 0xfc00
         || segments[0] & 0xffc0 == 0xfe80
+        || segments[0] & 0xffc0 == 0xfec0
         || ip.is_multicast())
 }
 
@@ -241,6 +242,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn classifies_ipv6_site_local_boundaries_without_broadening() {
+        let classify = |address: &str| is_public_ip(address.parse().unwrap());
+
+        assert_eq!(
+            [
+                classify("fec0::"),
+                classify("feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+                classify("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            ],
+            [false, false, true]
+        );
+    }
+
     #[tokio::test]
     async fn validating_resolver_rejects_injected_non_public_answers() {
         for address in ["10.0.0.1:80", "127.0.0.1:80", "169.254.169.254:80"] {
@@ -248,6 +263,15 @@ mod tests {
             let result = resolver.resolve("public.example".parse().unwrap()).await;
             assert!(result.is_err(), "{address}");
         }
+    }
+
+    #[tokio::test]
+    async fn validating_resolver_rejects_site_local_answer_before_http_contact() {
+        let resolver = PublicDnsResolver::new(StaticResolver("[fec0::1]:80".parse().unwrap()));
+
+        let result = resolver.resolve("public.example".parse().unwrap()).await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]
