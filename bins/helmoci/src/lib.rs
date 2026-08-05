@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod classic;
 pub mod config;
 pub mod error;

@@ -16,6 +16,10 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/", get(home))
         .route("/healthz", get(healthz))
         .fallback(oci_dispatch)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_pull_auth,
+        ))
         .with_state(state)
 }
 
