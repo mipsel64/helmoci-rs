@@ -1,5 +1,6 @@
 use crate::classic;
 use crate::error::AppError;
+use crate::passthrough;
 use crate::state::SharedState;
 use axum::Router;
 use axum::body::Body;
@@ -64,11 +65,16 @@ async fn oci_dispatch(State(state): State<SharedState>, req: Request<Body>) -> R
     };
     let proxy_host = proxy_host_from(req.headers());
     let query = req.uri().query().map(str::to_string);
+    let accept = req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     let result = match parse_oci_path(&path) {
         OciRoute::Api => Ok(api_response()),
         OciRoute::Manifest { name, reference } => {
-            manifest_entry(&state, &proxy_host, &name, &reference, head_only).await
+            manifest_entry(&state, &proxy_host, &name, &reference, head_only, accept).await
         }
         OciRoute::Blob { name, digest } => blob_entry(&state, &name, &digest, head_only).await,
         OciRoute::Tags { name } => tags_entry(&state, &name, query.as_deref(), head_only).await,
@@ -83,14 +89,15 @@ async fn manifest_entry(
     name: &str,
     reference: &str,
     head_only: bool,
+    accept: Option<String>,
 ) -> Result<Response, AppError> {
     match resolve_name(name, &state.cfg.aliases) {
         Some(Resolved::Classic(chart)) => {
             classic::manifest(state, proxy_host, chart, reference, head_only).await
         }
-        Some(Resolved::Oci(_)) => Err(AppError::Internal(
-            "oci pass-through is wired in a later task".into(),
-        )),
+        Some(Resolved::Oci(target)) => {
+            passthrough::manifest(state, proxy_host, target, reference, head_only, accept).await
+        }
         None => Err(AppError::NameUnknown(invalid_path_message(name))),
     }
 }
@@ -103,9 +110,7 @@ async fn blob_entry(
 ) -> Result<Response, AppError> {
     match resolve_name(name, &state.cfg.aliases) {
         Some(Resolved::Classic(_)) => classic::blob(state, digest, head_only).await,
-        Some(Resolved::Oci(_)) => Err(AppError::Internal(
-            "oci pass-through is wired in a later task".into(),
-        )),
+        Some(Resolved::Oci(target)) => passthrough::blob(state, target, digest, head_only).await,
         None => Err(AppError::NameUnknown(invalid_path_message(name))),
     }
 }
@@ -118,9 +123,7 @@ async fn tags_entry(
 ) -> Result<Response, AppError> {
     match resolve_name(name, &state.cfg.aliases) {
         Some(Resolved::Classic(chart)) => classic::tags(state, chart, query, head_only).await,
-        Some(Resolved::Oci(_)) => Err(AppError::Internal(
-            "oci pass-through is wired in a later task".into(),
-        )),
+        Some(Resolved::Oci(target)) => passthrough::tags(state, target, query, head_only).await,
         None => Err(AppError::NameUnknown(invalid_path_message(name))),
     }
 }

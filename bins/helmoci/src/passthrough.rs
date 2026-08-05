@@ -1,6 +1,22 @@
 use crate::error::AppError;
+use crate::respond::{blob_response, bytes_response};
 use crate::state::AppState;
+use axum::body::Body;
+use axum::http::{StatusCode, header};
+use axum::response::Response;
+use bytes::Bytes;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use helmoci_core::oci::{Digest, MEDIA_TYPE_MANIFEST, TagPointer};
 use helmoci_core::resolver::{OciTarget, UpstreamAuthKind, is_public_hostname};
+use helmoci_storage::{Blob, TagScope};
+
+const DEFAULT_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.oci.image.index.v1+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
 
 #[derive(Debug, PartialEq)]
 pub struct BearerChallenge {
@@ -189,6 +205,396 @@ pub async fn fetch_token(
         .ok_or_else(|| AppError::Upstream("token response had no token".into()))
 }
 
+fn upstream_base(target: &OciTarget) -> String {
+    let scheme = if target.plain_http { "http" } else { "https" };
+    format!("{scheme}://{}/v2/{}", target.registry, target.repo)
+}
+
+fn upstream_token_cache_key(target: &OciTarget) -> String {
+    let scheme = if target.plain_http { "http" } else { "https" };
+    let auth = match target.auth {
+        UpstreamAuthKind::None => "none",
+        UpstreamAuthKind::Gcp => "gcp",
+    };
+    format!("{scheme}|{auth}|{}|{}", target.registry, target.repo)
+}
+
+fn header_str(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+fn is_manifest_media_type(content_type: &str) -> bool {
+    matches!(
+        content_type.split(';').next().map(str::trim),
+        Some(MEDIA_TYPE_MANIFEST | OCI_INDEX_MEDIA_TYPE | DOCKER_MANIFEST_MEDIA_TYPE)
+    )
+}
+
+fn manifest_media_type(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    (value.get("schemaVersion")?.as_u64() == Some(2))
+        .then(|| value.get("mediaType")?.as_str())?
+        .filter(|media_type| is_manifest_media_type(media_type))
+        .map(str::to_string)
+}
+
+async fn buffered_blob(blob: Blob) -> Result<Vec<u8>, AppError> {
+    let mut bytes = Vec::with_capacity(blob.meta.size as usize);
+    let mut data = blob.data;
+    while let Some(chunk) = data.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(bytes)
+}
+
+async fn cached_manifest_response(
+    digest: &Digest,
+    blob: Blob,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    let bytes = buffered_blob(blob).await?;
+    if Digest::sha256(&bytes) != *digest {
+        return Err(AppError::ManifestUnknown(format!(
+            "manifest unknown: {digest}"
+        )));
+    }
+    let Some(media_type) = manifest_media_type(&bytes) else {
+        return Err(AppError::ManifestUnknown(format!(
+            "manifest unknown: {digest}"
+        )));
+    };
+    Ok(bytes_response(&media_type, digest, bytes, head_only))
+}
+
+/// GET/HEAD an upstream /v2 path, doing the Docker token dance on 401.
+pub async fn send_upstream(
+    state: &AppState,
+    target: &OciTarget,
+    method: reqwest::Method,
+    suffix: &str,
+    accept: Option<&str>,
+) -> Result<reqwest::Response, AppError> {
+    if target.auth == UpstreamAuthKind::Gcp && target.plain_http {
+        return Err(AppError::Upstream(
+            "gcp registry authentication requires an HTTPS target".into(),
+        ));
+    }
+
+    let url = format!("{}/{}", upstream_base(target), suffix);
+    let cache_key = upstream_token_cache_key(target);
+    let build = |token: Option<String>| {
+        let mut request = state.http.request(method.clone(), &url);
+        if let Some(accept) = accept {
+            request = request.header(reqwest::header::ACCEPT, accept);
+        }
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request
+    };
+
+    let response = build(state.upstream_tokens.get(&cache_key).await)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
+        })?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(response);
+    }
+
+    let challenge_header = header_str(&response, "www-authenticate").unwrap_or_default();
+    let Some(challenge) = parse_bearer_challenge(&challenge_header) else {
+        return Err(AppError::Upstream(
+            "upstream returned 401 without a usable bearer challenge".into(),
+        ));
+    };
+    let token = fetch_token(state, target, &challenge).await?;
+    state.upstream_tokens.insert(cache_key, token.clone()).await;
+    build(Some(token)).send().await.map_err(|error| {
+        AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
+    })
+}
+
+pub async fn manifest(
+    state: &AppState,
+    proxy_host: &str,
+    target: OciTarget,
+    reference: &str,
+    head_only: bool,
+    accept: Option<String>,
+) -> Result<Response, AppError> {
+    if target.store {
+        if let Some(digest) = Digest::parse(reference) {
+            if let Some(blob) = state.storage.get_blob(&digest).await? {
+                return cached_manifest_response(&digest, blob, head_only).await;
+            }
+        } else {
+            let scope = TagScope {
+                proxy_host,
+                full_name: &target.full_name,
+            };
+            if let Some(pointer) = state.storage.get_tag_pointer(&scope, reference).await?
+                && is_manifest_media_type(&pointer.media_type)
+                && let Some(blob) = state.storage.get_blob(&pointer.digest).await?
+            {
+                return cached_manifest_response(&pointer.digest, blob, head_only).await;
+            }
+        }
+    }
+
+    let method = if head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+    let accept = accept.as_deref().unwrap_or(DEFAULT_MANIFEST_ACCEPT);
+    let response = send_upstream(
+        state,
+        &target,
+        method,
+        &format!("manifests/{reference}"),
+        Some(accept),
+    )
+    .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::ManifestUnknown(format!(
+            "upstream manifest unknown: {}:{reference}",
+            target.full_name
+        )));
+    }
+    if !response.status().is_success() {
+        return Err(AppError::Upstream(format!(
+            "upstream registry returned HTTP {} for manifests/{reference}",
+            response.status().as_u16()
+        )));
+    }
+    let content_type =
+        header_str(&response, "content-type").unwrap_or_else(|| MEDIA_TYPE_MANIFEST.to_string());
+
+    if head_only {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, &content_type)
+            .header("Docker-Distribution-API-Version", "registry/2.0");
+        if let Some(length) = response.content_length() {
+            builder = builder.header(header::CONTENT_LENGTH, length);
+        }
+        if let Some(digest) = header_str(&response, "docker-content-digest") {
+            builder = builder.header("Docker-Content-Digest", digest);
+        }
+        return Ok(builder
+            .body(Body::empty())
+            .expect("static headers are valid"));
+    }
+
+    let bytes = response.bytes().await.map_err(|error| {
+        AppError::Upstream(format!(
+            "reading upstream manifest failed: {}",
+            error.without_url()
+        ))
+    })?;
+    let digest = Digest::sha256(&bytes);
+    if let Some(requested_digest) = Digest::parse(reference)
+        && requested_digest != digest
+    {
+        return Err(AppError::Upstream(format!(
+            "upstream manifest bytes did not match requested digest {requested_digest}"
+        )));
+    }
+    let Some(media_type) = manifest_media_type(&bytes) else {
+        return Err(AppError::Upstream(
+            "upstream response was not a supported OCI manifest".into(),
+        ));
+    };
+    if target.store {
+        state
+            .storage
+            .put_blob(&digest, &media_type, bytes.clone())
+            .await?;
+        if Digest::parse(reference).is_none() {
+            let scope = TagScope {
+                proxy_host,
+                full_name: &target.full_name,
+            };
+            let pointer = TagPointer {
+                digest: digest.clone(),
+                media_type: media_type.clone(),
+                size: bytes.len() as u64,
+            };
+            state
+                .storage
+                .put_tag_pointer(&scope, reference, &pointer)
+                .await?;
+        }
+    }
+    Ok(bytes_response(&media_type, &digest, bytes.to_vec(), false))
+}
+
+pub async fn blob(
+    state: &AppState,
+    target: OciTarget,
+    digest_str: &str,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    let Some(digest) = Digest::parse(digest_str) else {
+        return Err(AppError::BlobUnknown(format!(
+            "invalid digest: {digest_str}"
+        )));
+    };
+    if target.store
+        && let Some(blob) = state.storage.get_blob(&digest).await?
+    {
+        let content_type = blob
+            .meta
+            .content_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        return Ok(blob_response(&content_type, &digest, blob, head_only));
+    }
+
+    let method = if head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+    let response = send_upstream(state, &target, method, &format!("blobs/{digest}"), None).await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::BlobUnknown(format!("blob unknown: {digest}")));
+    }
+    if !response.status().is_success() {
+        return Err(AppError::Upstream(format!(
+            "upstream registry returned HTTP {} for blobs/{digest}",
+            response.status().as_u16()
+        )));
+    }
+    let content_type = header_str(&response, "content-type")
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &content_type)
+        .header("Docker-Content-Digest", digest.as_str())
+        .header("Docker-Distribution-API-Version", "registry/2.0");
+    if head_only {
+        if let Some(length) = response.content_length() {
+            builder = builder.header(header::CONTENT_LENGTH, length);
+        }
+        return Ok(builder
+            .body(Body::empty())
+            .expect("static headers are valid"));
+    }
+
+    let cacheable = target.store
+        && response
+            .content_length()
+            .map(|length| length <= state.cfg.settings.max_chart_bytes)
+            .unwrap_or(false);
+    if cacheable {
+        let bytes = response.bytes().await.map_err(|error| {
+            AppError::Upstream(format!(
+                "reading upstream blob failed: {}",
+                error.without_url()
+            ))
+        })?;
+        if Digest::sha256(&bytes) != digest {
+            return Err(AppError::Upstream(format!(
+                "upstream blob bytes did not match requested digest {digest}"
+            )));
+        }
+        state
+            .storage
+            .put_blob(&digest, &content_type, bytes.clone())
+            .await?;
+        return Ok(bytes_response(
+            &content_type,
+            &digest,
+            bytes.to_vec(),
+            false,
+        ));
+    }
+    if let Some(length) = response.content_length() {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    let data: BoxStream<'static, Result<Bytes, std::io::Error>> =
+        Box::pin(response.bytes_stream().map_err(std::io::Error::other));
+    Ok(builder
+        .body(Body::from_stream(data))
+        .expect("static headers are valid"))
+}
+
+pub async fn tags(
+    state: &AppState,
+    target: OciTarget,
+    query: Option<&str>,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    let suffix = match query {
+        Some(query) => format!("tags/list?{query}"),
+        None => "tags/list".to_string(),
+    };
+    let method = if head_only {
+        reqwest::Method::HEAD
+    } else {
+        reqwest::Method::GET
+    };
+    let response = send_upstream(state, &target, method, &suffix, None).await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::NameUnknown(format!(
+            "upstream repository unknown: {}",
+            target.full_name
+        )));
+    }
+    if !response.status().is_success() {
+        return Err(AppError::Upstream(format!(
+            "upstream registry returned HTTP {} for {suffix}",
+            response.status().as_u16()
+        )));
+    }
+    let link = header_str(&response, "link").map(|link| {
+        link.replace(
+            &format!("/v2/{}/", target.repo),
+            &format!("/v2/{}/", target.full_name),
+        )
+    });
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Docker-Distribution-API-Version", "registry/2.0");
+    if let Some(link) = link {
+        builder = builder.header(header::LINK, link);
+    }
+    if head_only {
+        if let Some(length) = response.content_length() {
+            builder = builder.header(header::CONTENT_LENGTH, length);
+        }
+        return Ok(builder
+            .body(Body::empty())
+            .expect("static headers are valid"));
+    }
+
+    let bytes = response.bytes().await.map_err(|error| {
+        AppError::Upstream(format!(
+            "reading upstream tag list failed: {}",
+            error.without_url()
+        ))
+    })?;
+    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut value) => {
+            value["name"] = serde_json::Value::String(target.full_name);
+            value.to_string()
+        }
+        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+    };
+    builder = builder.header(header::CONTENT_LENGTH, body.len());
+    Ok(builder
+        .body(Body::from(body))
+        .expect("static headers are valid"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +646,53 @@ mod tests {
             auth,
             plain_http,
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_gcp_before_cached_token_reuse() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/x/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, calls) = counting_gcp_state();
+        let server_uri = server.uri();
+        let registry = server_uri.trim_start_matches("http://");
+        let https_target = target(registry, UpstreamAuthKind::Gcp, false);
+        let anonymous_target = target(registry, UpstreamAuthKind::None, false);
+        let plaintext_target = target(registry, UpstreamAuthKind::Gcp, true);
+
+        assert_ne!(
+            upstream_token_cache_key(&https_target),
+            upstream_token_cache_key(&plaintext_target)
+        );
+        assert_ne!(
+            upstream_token_cache_key(&https_target),
+            upstream_token_cache_key(&anonymous_target)
+        );
+        state
+            .upstream_tokens
+            .insert(
+                upstream_token_cache_key(&https_target),
+                "must-not-be-sent".to_string(),
+            )
+            .await;
+
+        let error = send_upstream(
+            &state,
+            &plaintext_target,
+            reqwest::Method::GET,
+            "manifests/latest",
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.verify().await;
     }
 
     #[test]
