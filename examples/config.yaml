@@ -1,0 +1,15 @@
+listen: 0.0.0.0:8080
+
+storage:
+  type: local
+  settings:
+    path: /tmp/helmoci-cache
+
+aliases:
+  argo:
+    upstream: https://argoproj.github.io/argo-helm
+    store: true
+  # upstream-oci:
+  #   upstream: oci://registry.example.com/team/charts
+  #   auth: gcp
+  #   store: false
