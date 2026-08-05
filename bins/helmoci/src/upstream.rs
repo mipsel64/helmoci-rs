@@ -1,9 +1,11 @@
 use crate::error::AppError;
+use crate::metrics::UpstreamKind;
 use crate::state::AppState;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use helmoci_core::resolver::is_public_hostname;
 use reqwest::header::{AUTHORIZATION, COOKIE, HeaderMap, LOCATION, PROXY_AUTHORIZATION};
+use std::time::Instant;
 
 const MAX_REDIRECTS: usize = 5;
 
@@ -84,6 +86,7 @@ pub(crate) async fn send(
     mut headers: HeaderMap,
     mut client: InitialClient,
     follow_redirects: bool,
+    kind: UpstreamKind,
 ) -> Result<reqwest::Response, AppError> {
     if client == InitialClient::Public {
         validate_public_https(&url)?;
@@ -95,14 +98,34 @@ pub(crate) async fn send(
             InitialClient::TokenTrusted => &state.token_http,
             InitialClient::Public => &state.public_http,
         };
-        let response = http
+        let started = Instant::now();
+        tracing::debug!(kind = kind.label(), "upstream request start");
+        let result = http
             .request(method.clone(), url.clone())
             .headers(headers.clone())
             .send()
-            .await
-            .map_err(|error| {
-                AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
-            })?;
+            .await;
+        metrics::histogram!(
+            "helmoci_upstream_request_duration_seconds",
+            "kind" => kind.label(),
+        )
+        .record(started.elapsed().as_secs_f64());
+        match &result {
+            Ok(response) => tracing::debug!(
+                kind = kind.label(),
+                status = response.status().as_u16(),
+                success = true,
+                "upstream request complete"
+            ),
+            Err(_) => tracing::debug!(
+                kind = kind.label(),
+                success = false,
+                "upstream request complete"
+            ),
+        }
+        let response = result.map_err(|error| {
+            AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
+        })?;
         if !follow_redirects || !redirect_status(response.status()) {
             return Ok(response);
         }
@@ -113,6 +136,11 @@ pub(crate) async fn send(
         }
         url = redirect_target(&url, response.headers(), &mut headers, &mut client)?;
         followed += 1;
+        tracing::debug!(
+            kind = kind.label(),
+            hop = followed,
+            "upstream redirect follow"
+        );
     }
 }
 

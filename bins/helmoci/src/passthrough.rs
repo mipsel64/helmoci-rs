@@ -1,5 +1,6 @@
 use crate::error::AppError;
-use crate::respond::bytes_response;
+use crate::metrics::{ProxyKind, ProxySource, ProxyUpstream, UpstreamKind};
+use crate::respond::{blob_bytes_response, bytes_response};
 use crate::state::AppState;
 use crate::upstream::{self, InitialClient};
 use axum::body::Body;
@@ -189,28 +190,35 @@ pub async fn fetch_token(
     target: &OciTarget,
     challenge: &BearerChallenge,
 ) -> Result<String, AppError> {
-    let (request, client) = build_token_request(state, target, challenge).await?;
-    let response = upstream::send(
-        state,
-        request.method().clone(),
-        request.url().clone(),
-        request.headers().clone(),
-        client,
-        true,
-    )
-    .await?;
-    if !response.status().is_success() {
-        return Err(AppError::Upstream(format!(
-            "token endpoint returned HTTP {}",
-            response.status().as_u16()
-        )));
+    tracing::debug!("registry token refresh start");
+    let result = async {
+        let (request, client) = build_token_request(state, target, challenge).await?;
+        let response = upstream::send(
+            state,
+            request.method().clone(),
+            request.url().clone(),
+            request.headers().clone(),
+            client,
+            true,
+            UpstreamKind::OciToken,
+        )
+        .await?;
+        if !response.status().is_success() {
+            return Err(AppError::Upstream(format!(
+                "token endpoint returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let bytes = upstream::read_response(response, 1024 * 1024, "token response").await?;
+        let body: TokenResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| AppError::Upstream("invalid token response".into()))?;
+        body.token
+            .or(body.access_token)
+            .ok_or_else(|| AppError::Upstream("token response had no token".into()))
     }
-    let bytes = upstream::read_response(response, 1024 * 1024, "token response").await?;
-    let body: TokenResponse = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Upstream("invalid token response".into()))?;
-    body.token
-        .or(body.access_token)
-        .ok_or_else(|| AppError::Upstream("token response had no token".into()))
+    .await;
+    tracing::debug!(success = result.is_ok(), "registry token refresh complete");
+    result
 }
 
 fn upstream_url(target: &OciTarget, suffix: &str) -> Result<url::Url, AppError> {
@@ -555,6 +563,13 @@ pub async fn send_upstream(
     }
 
     let url = upstream_url(target, suffix)?;
+    let kind = if suffix.starts_with("blobs/") {
+        UpstreamKind::OciBlob
+    } else if suffix.starts_with("tags/list") {
+        UpstreamKind::OciTags
+    } else {
+        UpstreamKind::OciManifest
+    };
     let cache_key = upstream_token_cache_key(target);
     let build_headers = |token: Option<String>| {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -578,6 +593,7 @@ pub async fn send_upstream(
         build_headers(state.upstream_tokens.get(&cache_key).await)?,
         InitialClient::Trusted,
         true,
+        kind,
     )
     .await?;
     if response.status() != reqwest::StatusCode::UNAUTHORIZED {
@@ -604,6 +620,7 @@ pub async fn send_upstream(
         build_headers(Some(token))?,
         InitialClient::Trusted,
         true,
+        kind,
     )
     .await
 }
@@ -620,7 +637,20 @@ pub async fn manifest(
     if target.store {
         if let Some(digest) = Digest::parse(reference) {
             if let Some(blob) = state.storage.get_blob(&digest).await? {
-                return cached_manifest_response(&digest, blob, head_only, max_bytes).await;
+                let result = cached_manifest_response(&digest, blob, head_only, max_bytes).await;
+                if let Ok(response) = result {
+                    metrics::counter!("helmoci_oci_manifest_cache_hits_total").increment(1);
+                    tracing::debug!(kind = "manifest", "OCI cache hit");
+                    crate::metrics::record_proxy_response(
+                        ProxyKind::Manifest,
+                        ProxyUpstream::Oci,
+                        ProxySource::PersistentCache,
+                    );
+                    return Ok(response);
+                }
+                metrics::counter!("helmoci_oci_manifest_cache_misses_total").increment(1);
+                tracing::debug!(kind = "manifest", "OCI cache miss");
+                return result;
             }
         } else {
             let scope = TagScope {
@@ -632,9 +662,25 @@ pub async fn manifest(
                 && accepts_media_type(accept.as_deref(), &pointer.media_type)
                 && let Some(blob) = state.storage.get_blob(&pointer.digest).await?
             {
-                return cached_manifest_response(&pointer.digest, blob, head_only, max_bytes).await;
+                let result =
+                    cached_manifest_response(&pointer.digest, blob, head_only, max_bytes).await;
+                if let Ok(response) = result {
+                    metrics::counter!("helmoci_oci_manifest_cache_hits_total").increment(1);
+                    tracing::debug!(kind = "manifest", "OCI cache hit");
+                    crate::metrics::record_proxy_response(
+                        ProxyKind::Manifest,
+                        ProxyUpstream::Oci,
+                        ProxySource::PersistentCache,
+                    );
+                    return Ok(response);
+                }
+                metrics::counter!("helmoci_oci_manifest_cache_misses_total").increment(1);
+                tracing::debug!(kind = "manifest", "OCI cache miss");
+                return result;
             }
         }
+        metrics::counter!("helmoci_oci_manifest_cache_misses_total").increment(1);
+        tracing::debug!(kind = "manifest", "OCI cache miss");
     }
 
     let method = if head_only {
@@ -680,9 +726,15 @@ pub async fn manifest(
         if let Some(etag) = header_str(&response, "etag") {
             builder = builder.header(header::ETAG, etag);
         }
-        return Ok(builder
+        let response = builder
             .body(Body::empty())
-            .expect("static headers are valid"));
+            .expect("static headers are valid");
+        crate::metrics::record_proxy_response(
+            ProxyKind::Manifest,
+            ProxyUpstream::Oci,
+            ProxySource::Upstream,
+        );
+        return Ok(response);
     }
 
     let bytes = read_upstream_body(response, max_bytes, "manifest").await?;
@@ -720,7 +772,13 @@ pub async fn manifest(
                 .await?;
         }
     }
-    Ok(bytes_response(&media_type, &digest, bytes.to_vec(), false))
+    let response = bytes_response(&media_type, &digest, bytes.to_vec(), false);
+    crate::metrics::record_proxy_response(
+        ProxyKind::Manifest,
+        ProxyUpstream::Oci,
+        ProxySource::Upstream,
+    );
+    Ok(response)
 }
 
 pub async fn blob(
@@ -745,8 +803,27 @@ pub async fn blob(
         if let Ok(bytes) = read_cached_blob(blob, state.cfg.settings.max_chart_bytes).await
             && Digest::sha256(&bytes) == digest
         {
-            return Ok(bytes_response(&content_type, &digest, bytes, head_only));
+            metrics::counter!("helmoci_oci_blob_cache_hits_total").increment(1);
+            tracing::debug!(kind = "blob", "OCI cache hit");
+            let response = blob_bytes_response(
+                &content_type,
+                &digest,
+                bytes,
+                head_only,
+                ProxyUpstream::Oci,
+                ProxySource::PersistentCache,
+            );
+            crate::metrics::record_proxy_response(
+                ProxyKind::Blob,
+                ProxyUpstream::Oci,
+                ProxySource::PersistentCache,
+            );
+            return Ok(response);
         }
+    }
+    if target.store {
+        metrics::counter!("helmoci_oci_blob_cache_misses_total").increment(1);
+        tracing::debug!(kind = "blob", "OCI cache miss");
     }
 
     let method = if head_only {
@@ -779,9 +856,15 @@ pub async fn blob(
         if let Some(etag) = etag {
             builder = builder.header(header::ETAG, etag);
         }
-        return Ok(builder
+        let response = builder
             .body(Body::empty())
-            .expect("static headers are valid"));
+            .expect("static headers are valid");
+        crate::metrics::record_proxy_response(
+            ProxyKind::Blob,
+            ProxyUpstream::Oci,
+            ProxySource::Upstream,
+        );
+        return Ok(response);
     }
 
     let cacheable = target.store
@@ -801,12 +884,20 @@ pub async fn blob(
             .storage
             .put_blob(&digest, &content_type, bytes.clone().into())
             .await?;
-        return Ok(bytes_response(
+        let response = blob_bytes_response(
             &content_type,
             &digest,
             bytes.to_vec(),
             false,
-        ));
+            ProxyUpstream::Oci,
+            ProxySource::Upstream,
+        );
+        crate::metrics::record_proxy_response(
+            ProxyKind::Blob,
+            ProxyUpstream::Oci,
+            ProxySource::Upstream,
+        );
+        return Ok(response);
     }
     if let Some(length) = response.content_length() {
         builder = builder.header(header::CONTENT_LENGTH, length);
@@ -814,11 +905,28 @@ pub async fn blob(
     if let Some(etag) = etag {
         builder = builder.header(header::ETAG, etag);
     }
-    let data: BoxStream<'static, Result<Bytes, std::io::Error>> =
-        Box::pin(response.bytes_stream().map_err(std::io::Error::other));
-    Ok(builder
+    let data: BoxStream<'static, Result<Bytes, std::io::Error>> = Box::pin(
+        response
+            .bytes_stream()
+            .map_ok(|chunk| {
+                crate::metrics::record_blob_bytes(
+                    ProxyUpstream::Oci,
+                    ProxySource::Upstream,
+                    chunk.len(),
+                );
+                chunk
+            })
+            .map_err(std::io::Error::other),
+    );
+    let response = builder
         .body(Body::from_stream(data))
-        .expect("static headers are valid"))
+        .expect("static headers are valid");
+    crate::metrics::record_proxy_response(
+        ProxyKind::Blob,
+        ProxyUpstream::Oci,
+        ProxySource::Upstream,
+    );
+    Ok(response)
 }
 
 pub async fn tags(
@@ -872,7 +980,13 @@ pub async fn tags(
     } else {
         Body::from(body)
     };
-    Ok(builder.body(body).expect("static headers are valid"))
+    let response = builder.body(body).expect("static headers are valid");
+    crate::metrics::record_proxy_response(
+        ProxyKind::Tags,
+        ProxyUpstream::Oci,
+        ProxySource::Upstream,
+    );
+    Ok(response)
 }
 
 #[cfg(test)]

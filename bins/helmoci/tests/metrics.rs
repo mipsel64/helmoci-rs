@@ -1,8 +1,12 @@
 mod common;
 
 use axum::http::StatusCode;
+use axum::{body::Body, http::Request};
 use helmoci_core::helm::tgz::testutil::build_chart_tgz;
+use helmoci_core::oci::Digest;
+use http_body_util::BodyExt;
 use std::collections::BTreeSet;
+use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -26,6 +30,78 @@ fn counter_value(text: &str, name: &str) -> f64 {
             value.parse().ok()
         })
         .unwrap_or(0.0)
+}
+
+fn labeled_counter_value(text: &str, name: &str, labels: &[(&str, &str)]) -> f64 {
+    text.lines()
+        .find_map(|line| {
+            let sample = line.strip_prefix(name)?.strip_prefix('{')?;
+            if !labels
+                .iter()
+                .all(|(key, value)| sample.contains(&format!(r#"{key}="{value}""#)))
+            {
+                return None;
+            }
+            sample.split_whitespace().last()?.parse().ok()
+        })
+        .unwrap_or(0.0)
+}
+
+fn label_values<'a>(text: &'a str, metric: &str, label: &str) -> BTreeSet<&'a str> {
+    text.lines()
+        .filter(|line| line.starts_with(metric))
+        .filter_map(|line| line.split(&format!(r#"{label}=""#)).nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect()
+}
+
+fn assert_observability_labels_are_bounded(text: &str) {
+    let checks = [
+        (
+            "helmoci_upstream_request_duration_seconds",
+            "kind",
+            BTreeSet::from([
+                "classic_index",
+                "classic_chart",
+                "oci_manifest",
+                "oci_blob",
+                "oci_tags",
+                "oci_token",
+            ]),
+        ),
+        (
+            "helmoci_proxy_responses_total",
+            "kind",
+            BTreeSet::from(["manifest", "blob", "tags"]),
+        ),
+        (
+            "helmoci_proxy_responses_total",
+            "upstream",
+            BTreeSet::from(["classic", "oci"]),
+        ),
+        (
+            "helmoci_proxy_responses_total",
+            "source",
+            BTreeSet::from(["upstream", "persistent_cache", "ephemeral_cache"]),
+        ),
+        (
+            "helmoci_blob_bytes_served_total",
+            "upstream",
+            BTreeSet::from(["classic", "oci"]),
+        ),
+        (
+            "helmoci_blob_bytes_served_total",
+            "source",
+            BTreeSet::from(["upstream", "persistent_cache", "ephemeral_cache"]),
+        ),
+    ];
+    for (metric, label, allowed) in checks {
+        let actual = label_values(text, metric, label);
+        assert!(
+            actual.is_subset(&allowed),
+            "unbounded {metric} {label} labels: {actual:?}\n{text}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -181,6 +257,7 @@ async fn classic_cache_counters_track_successful_fill_and_hits() {
         counter_value(&before, "helmoci_index_cache_hits_total"),
         counter_value(&before, "helmoci_index_cache_misses_total"),
         counter_value(&before, "helmoci_manifest_cache_hits_total"),
+        counter_value(&before, "helmoci_manifest_cache_misses_total"),
     ];
 
     let (status, _, _) =
@@ -208,6 +285,212 @@ async fn classic_cache_counters_track_successful_fill_and_hits() {
         counter_value(&after, "helmoci_manifest_cache_hits_total"),
         baseline[2] + 1.0,
         "{after}"
+    );
+    assert!(
+        counter_value(&after, "helmoci_manifest_cache_misses_total") >= baseline[3] + 1.0,
+        "{after}"
+    );
+    for kind in ["classic_index", "classic_chart"] {
+        assert!(
+            after.lines().any(|line| {
+                line.starts_with("helmoci_upstream_request_duration_seconds")
+                    && line.contains(&format!(r#"kind="{kind}""#))
+            }),
+            "missing upstream duration for {kind}: {after}"
+        );
+    }
+    for (kind, source) in [
+        ("manifest", "upstream"),
+        ("manifest", "persistent_cache"),
+        ("tags", "ephemeral_cache"),
+    ] {
+        assert!(
+            labeled_counter_value(
+                &after,
+                "helmoci_proxy_responses_total",
+                &[("kind", kind), ("upstream", "classic"), ("source", source)],
+            ) >= 1.0,
+            "missing classic {kind}/{source} response source: {after}"
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn oci_metrics_track_upstream_and_persistent_cache_without_raw_values() {
+    const SENTINEL: &str = "OCI_METRICS_SENTINEL";
+    const MANIFEST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v2/{SENTINEL}/charts/app/manifests/latest")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                .set_body_string(MANIFEST),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = format!(
+        concat!(
+            "storage:\n  type: memory\n",
+            "aliases:\n",
+            "  observed:\n",
+            "    upstream: oci://{host}/{repo}/charts\n",
+            "    plain_http: true\n",
+            "    store: true\n",
+        ),
+        host = server.uri().trim_start_matches("http://"),
+        repo = SENTINEL,
+    );
+    let app = common::app(&cfg);
+    let (_, _, before) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    let before = String::from_utf8_lossy(&before);
+    let hits_before = counter_value(&before, "helmoci_oci_manifest_cache_hits_total");
+    let misses_before = counter_value(&before, "helmoci_oci_manifest_cache_misses_total");
+
+    for _ in 0..2 {
+        let (status, _, body) = common::send(
+            &app,
+            "GET",
+            "/v2/observed/app/manifests/latest",
+            "proxy.test",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
+    let (_, _, after) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    let after = String::from_utf8_lossy(&after);
+    assert_eq!(
+        counter_value(&after, "helmoci_oci_manifest_cache_hits_total"),
+        hits_before + 1.0,
+        "{after}"
+    );
+    assert_eq!(
+        counter_value(&after, "helmoci_oci_manifest_cache_misses_total"),
+        misses_before + 1.0,
+        "{after}"
+    );
+    assert!(
+        after.lines().any(|line| {
+            line.starts_with("helmoci_upstream_request_duration_seconds")
+                && line.contains(r#"kind="oci_manifest""#)
+        }),
+        "{after}"
+    );
+    for source in ["upstream", "persistent_cache"] {
+        assert!(
+            labeled_counter_value(
+                &after,
+                "helmoci_proxy_responses_total",
+                &[
+                    ("kind", "manifest"),
+                    ("upstream", "oci"),
+                    ("source", source),
+                ],
+            ) >= 1.0,
+            "missing OCI manifest/{source} response source: {after}"
+        );
+    }
+    for raw in [SENTINEL, "observed/app", "latest", server.uri().as_str()] {
+        assert!(!after.contains(raw), "metrics leaked {raw:?}: {after}");
+    }
+    assert_observability_labels_are_bounded(&after);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn streamed_blob_bytes_are_counted_only_as_get_body_is_emitted() {
+    let server = MockServer::start().await;
+    let blob = b"streamed-observable-blob";
+    let digest = Digest::sha256(blob);
+    let upstream_path = format!("/v2/up/charts/app/blobs/{digest}");
+    Mock::given(method("GET"))
+        .and(path(&upstream_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("HEAD"))
+        .and(path(&upstream_path))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("content-length", blob.len().to_string()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cfg = format!(
+        concat!(
+            "storage:\n  type: memory\n",
+            "aliases:\n",
+            "  observed:\n",
+            "    upstream: oci://{host}/up/charts\n",
+            "    plain_http: true\n",
+            "    store: false\n",
+        ),
+        host = server.uri().trim_start_matches("http://"),
+    );
+    let app = common::app(&cfg);
+    let labels = &[("upstream", "oci"), ("source", "upstream")];
+    let (_, _, metrics) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    let baseline = labeled_counter_value(
+        &String::from_utf8_lossy(&metrics),
+        "helmoci_blob_bytes_served_total",
+        labels,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v2/observed/app/blobs/{digest}"))
+                .header("host", "proxy.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, _, metrics) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    assert_eq!(
+        labeled_counter_value(
+            &String::from_utf8_lossy(&metrics),
+            "helmoci_blob_bytes_served_total",
+            labels,
+        ),
+        baseline,
+        "bytes were counted before the response body was emitted"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), blob);
+    let (_, _, metrics) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    let after_get = labeled_counter_value(
+        &String::from_utf8_lossy(&metrics),
+        "helmoci_blob_bytes_served_total",
+        labels,
+    );
+    assert_eq!(after_get, baseline + blob.len() as f64);
+
+    let (status, _, body) = common::send(
+        &app,
+        "HEAD",
+        &format!("/v2/observed/app/blobs/{digest}"),
+        "proxy.test",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty());
+    let (_, _, metrics) = common::send(&app, "GET", "/metrics", "proxy.test").await;
+    assert_eq!(
+        labeled_counter_value(
+            &String::from_utf8_lossy(&metrics),
+            "helmoci_blob_bytes_served_total",
+            labels,
+        ),
+        after_get,
+        "HEAD must not add served body bytes"
     );
     server.verify().await;
 }

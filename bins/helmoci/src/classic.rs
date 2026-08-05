@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::metrics::{ProxyKind, ProxySource, ProxyUpstream, UpstreamKind};
 use crate::respond::{blob_response, bytes_response};
 use crate::state::AppState;
 use crate::upstream::{self, InitialClient};
@@ -39,19 +40,29 @@ async fn send_classic(
     url: url::Url,
     source: ClassicSource,
     headers: reqwest::header::HeaderMap,
+    kind: UpstreamKind,
 ) -> Result<reqwest::Response, AppError> {
     let (client, redirects) = match source {
         ClassicSource::ConfiguredAlias => (InitialClient::Trusted, true),
         ClassicSource::HostPath => (InitialClient::Public, false),
     };
-    upstream::send(state, reqwest::Method::GET, url, headers, client, redirects).await
+    upstream::send(
+        state,
+        reqwest::Method::GET,
+        url,
+        headers,
+        client,
+        redirects,
+        kind,
+    )
+    .await
 }
 
-pub async fn fetch_index_text(
+async fn fetch_index_text_with_source(
     state: &AppState,
     repo_url: &str,
     source: ClassicSource,
-) -> Result<Arc<String>, AppError> {
+) -> Result<(Arc<String>, ProxySource), AppError> {
     let index_url = index_url(repo_url)?;
     let cache_prefix = match source {
         ClassicSource::ConfiguredAlias => "configured",
@@ -64,7 +75,7 @@ pub async fn fetch_index_text(
     if let Some(text) = state.index_cache.get(&cache_key).await {
         metrics::counter!("helmoci_index_cache_hits_total").increment(1);
         tracing::debug!("index cache hit");
-        return Ok(text);
+        return Ok((text, ProxySource::EphemeralCache));
     }
 
     let mut headers = reqwest::header::HeaderMap::new();
@@ -72,7 +83,14 @@ pub async fn fetch_index_text(
         reqwest::header::ACCEPT,
         reqwest::header::HeaderValue::from_static("application/yaml, text/yaml, text/plain, */*"),
     );
-    let resp = send_classic(state, index_url, source, headers).await?;
+    let resp = send_classic(
+        state,
+        index_url,
+        source,
+        headers,
+        UpstreamKind::ClassicIndex,
+    )
+    .await?;
 
     if !resp.status().is_success() {
         return Err(AppError::Upstream(format!(
@@ -89,7 +107,17 @@ pub async fn fetch_index_text(
     );
     state.index_cache.insert(cache_key, text.clone()).await;
     metrics::counter!("helmoci_index_cache_misses_total").increment(1);
-    Ok(text)
+    Ok((text, ProxySource::Upstream))
+}
+
+pub async fn fetch_index_text(
+    state: &AppState,
+    repo_url: &str,
+    source: ClassicSource,
+) -> Result<Arc<String>, AppError> {
+    Ok(fetch_index_text_with_source(state, repo_url, source)
+        .await?
+        .0)
 }
 
 /// Download a chart tgz, enforcing max_chart_bytes while streaming.
@@ -120,6 +148,7 @@ pub async fn download_chart(
         reqwest::header::HeaderMap::new(),
         client,
         redirects,
+        UpstreamKind::ClassicChart,
     )
     .await?;
 
@@ -141,11 +170,18 @@ fn backend(state: &AppState, ephemeral: bool) -> Arc<dyn Storage> {
 }
 
 /// Look in persistent storage first, then the ephemeral cache.
-pub async fn find_blob(state: &AppState, digest: &Digest) -> Result<Option<Blob>, AppError> {
+async fn find_blob(
+    state: &AppState,
+    digest: &Digest,
+) -> Result<Option<(Blob, ProxySource)>, AppError> {
     if let Some(blob) = state.storage.get_blob(digest).await? {
-        return Ok(Some(blob));
+        return Ok(Some((blob, ProxySource::PersistentCache)));
     }
-    Ok(state.ephemeral.get_blob(digest).await?)
+    Ok(state
+        .ephemeral
+        .get_blob(digest)
+        .await?
+        .map(|blob| (blob, ProxySource::EphemeralCache)))
 }
 
 fn valid_helm_manifest(bytes: &[u8]) -> bool {
@@ -205,14 +241,20 @@ pub async fn manifest(
 ) -> Result<Response, AppError> {
     if let Some(digest) = Digest::parse(reference) {
         return match find_blob(state, &digest).await? {
-            Some(blob) => {
-                digest_manifest_response(
+            Some((blob, source)) => {
+                let response = digest_manifest_response(
                     &digest,
                     blob,
                     head_only,
                     state.cfg.settings.max_chart_bytes,
                 )
-                .await
+                .await?;
+                crate::metrics::record_proxy_response(
+                    ProxyKind::Manifest,
+                    ProxyUpstream::Classic,
+                    source,
+                );
+                Ok(response)
             }
             None => Err(AppError::ManifestUnknown(format!(
                 "manifest unknown: {digest}"
@@ -240,9 +282,19 @@ pub async fn manifest(
     {
         metrics::counter!("helmoci_manifest_cache_hits_total").increment(1);
         tracing::info!("manifest cache hit");
+        crate::metrics::record_proxy_response(
+            ProxyKind::Manifest,
+            ProxyUpstream::Classic,
+            if chart.ephemeral {
+                ProxySource::EphemeralCache
+            } else {
+                ProxySource::PersistentCache
+            },
+        );
         return Ok(response);
     }
 
+    metrics::counter!("helmoci_manifest_cache_misses_total").increment(1);
     let index = fetch_index_text(state, &chart.repo_url, chart.source).await?;
     let chart_url = helmoci_core::helm::index::resolve_chart_url(
         &index,
@@ -297,12 +349,18 @@ pub async fn manifest(
     )?;
     store.put_tag_pointer(&scope, reference, &pointer).await?;
 
-    Ok(bytes_response(
+    let response = bytes_response(
         MEDIA_TYPE_MANIFEST,
         &manifest_digest,
         manifest_bytes,
         head_only,
-    ))
+    );
+    crate::metrics::record_proxy_response(
+        ProxyKind::Manifest,
+        ProxyUpstream::Classic,
+        ProxySource::Upstream,
+    );
+    Ok(response)
 }
 
 pub async fn blob(
@@ -316,13 +374,22 @@ pub async fn blob(
         )));
     };
     match find_blob(state, &digest).await? {
-        Some(blob) => {
+        Some((blob, source)) => {
             let ct = blob
                 .meta
                 .content_type
                 .clone()
                 .unwrap_or_else(|| "application/octet-stream".to_string());
-            Ok(blob_response(&ct, &digest, blob, head_only))
+            let response = blob_response(
+                &ct,
+                &digest,
+                blob,
+                head_only,
+                ProxyUpstream::Classic,
+                source,
+            );
+            crate::metrics::record_proxy_response(ProxyKind::Blob, ProxyUpstream::Classic, source);
+            Ok(response)
         }
         None => Err(AppError::BlobUnknown(format!("blob unknown: {digest}"))),
     }
@@ -334,7 +401,8 @@ pub async fn tags(
     query: Option<&str>,
     head_only: bool,
 ) -> Result<Response, AppError> {
-    let index = fetch_index_text(state, &chart.repo_url, chart.source).await?;
+    let (index, source) =
+        fetch_index_text_with_source(state, &chart.repo_url, chart.source).await?;
     let mut tags =
         helmoci_core::helm::index::list_versions(&index, &chart.repo_url, &chart.chart_name)
             .map_err(AppError::from_helm_for_tags)?;
@@ -386,7 +454,9 @@ pub async fn tags(
     } else {
         Body::from(body)
     };
-    Ok(builder.body(body).expect("static headers are valid"))
+    let response = builder.body(body).expect("static headers are valid");
+    crate::metrics::record_proxy_response(ProxyKind::Tags, ProxyUpstream::Classic, source);
+    Ok(response)
 }
 
 #[cfg(test)]
