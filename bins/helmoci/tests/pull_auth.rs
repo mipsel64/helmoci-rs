@@ -83,7 +83,7 @@ async fn public_paths_bypass_auth_without_changing_responses() {
     for (path, expected) in [
         ("/", StatusCode::OK),
         ("/healthz", StatusCode::OK),
-        ("/metrics", StatusCode::NOT_FOUND),
+        ("/metrics", StatusCode::OK),
     ] {
         let response = send_authed(&app, path, None).await;
         assert_eq!(response.status(), expected, "{path}");

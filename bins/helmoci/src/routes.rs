@@ -12,14 +12,17 @@ use helmoci_core::oci::route::{OciRoute, parse_oci_path};
 use helmoci_core::resolver::{Resolved, resolve_name};
 
 pub fn build_router(state: SharedState) -> Router {
+    let _ = crate::metrics::handle();
     Router::new()
         .route("/", get(home))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_endpoint))
         .fallback(oci_dispatch)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_pull_auth,
         ))
+        .layer(axum::middleware::from_fn(crate::metrics::record_http))
         .with_state(state)
 }
 
@@ -29,6 +32,10 @@ async fn home() -> Html<&'static str> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn metrics_endpoint() -> String {
+    crate::metrics::handle().render()
 }
 
 pub fn invalid_path_message(name: &str) -> String {

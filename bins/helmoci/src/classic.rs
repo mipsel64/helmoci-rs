@@ -49,6 +49,7 @@ pub async fn fetch_index_text(
     let cache_key = format!("{cache_prefix}:{index_url}");
     let http = http_client(state, &index_url, source)?;
     if let Some(text) = state.index_cache.get(&cache_key).await {
+        metrics::counter!("helmoci_index_cache_hits_total").increment(1);
         tracing::debug!(url = %index_url, "index cache hit");
         return Ok(text);
     }
@@ -81,6 +82,7 @@ pub async fn fetch_index_text(
             .map_err(|e| AppError::Upstream(e.to_string()))?,
     );
     state.index_cache.insert(cache_key, text.clone()).await;
+    metrics::counter!("helmoci_index_cache_misses_total").increment(1);
     Ok(text)
 }
 
@@ -216,6 +218,7 @@ pub async fn manifest(
     if let Some(ptr) = store.get_tag_pointer(&scope, reference).await?
         && let Some(blob) = store.get_blob(&ptr.digest).await?
     {
+        metrics::counter!("helmoci_manifest_cache_hits_total").increment(1);
         tracing::info!(name = %chart.full_name, tag = reference, "manifest cache hit");
         return Ok(blob_response(&ptr.media_type, &ptr.digest, blob, head_only));
     }

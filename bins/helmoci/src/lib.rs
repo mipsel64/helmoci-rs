@@ -3,6 +3,7 @@ pub mod classic;
 pub mod config;
 pub mod error;
 pub mod gcp;
+pub mod metrics;
 pub mod passthrough;
 pub mod respond;
 pub mod routes;

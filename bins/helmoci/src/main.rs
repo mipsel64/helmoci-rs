@@ -1,7 +1,8 @@
 use clap::Parser;
-use helmoci::{config, routes, state};
+use helmoci::{config, gcp, metrics, routes, state};
 use helmoci_core::resolver::UpstreamAuthKind;
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
@@ -16,6 +17,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
     let args = Args::parse();
     let rc = config::load_config(&args.config)?;
     let storage = config::build_storage(&rc.settings.storage)?;
@@ -23,16 +29,17 @@ async fn main() -> eyre::Result<()> {
         .aliases
         .values()
         .any(|alias| alias.auth == UpstreamAuthKind::Gcp);
-    let gcp_provider: Option<Arc<dyn helmoci::gcp::GcpTokenProvider>> = if needs_gcp {
-        Some(Arc::new(helmoci::gcp::RealGcpTokenProvider::new().await?))
+    let gcp_provider: Option<Arc<dyn gcp::GcpTokenProvider>> = if needs_gcp {
+        Some(Arc::new(gcp::RealGcpTokenProvider::new().await?))
     } else {
         None
     };
+    let _ = metrics::handle();
     let listen = rc.settings.listen.clone();
     let state = state::AppState::new(rc, storage, gcp_provider)?;
     let app = routes::build_router(state);
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    println!("helmoci listening on {listen}");
+    tracing::info!(%listen, "helmoci listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
