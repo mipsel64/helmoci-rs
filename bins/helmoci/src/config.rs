@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use eyre::{WrapErr, bail, eyre};
 use helmoci_core::resolver::{
     Alias, AliasUpstream, UpstreamAuthKind, classic_alias_rewrite_map, is_valid_alias_name,
     parse_alias_upstream,
@@ -132,7 +132,7 @@ pub struct RuntimeConfig {
     pub classic_alias_by_repo: HashMap<String, String>,
 }
 
-pub fn interpolate_env(raw: &str) -> anyhow::Result<String> {
+pub fn interpolate_env(raw: &str) -> eyre::Result<String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     while let Some(start) = rest.find("${") {
@@ -142,8 +142,8 @@ pub fn interpolate_env(raw: &str) -> anyhow::Result<String> {
             bail!("unterminated ${{...}} in config")
         };
         let var = &after[..end];
-        let val =
-            std::env::var(var).with_context(|| format!("environment variable {var} is not set"))?;
+        let val = std::env::var(var)
+            .wrap_err_with(|| format!("environment variable {var} is not set"))?;
         out.push_str(&val);
         rest = &after[end + 1..];
     }
@@ -151,19 +151,19 @@ pub fn interpolate_env(raw: &str) -> anyhow::Result<String> {
     Ok(out)
 }
 
-pub fn parse_config(raw_yaml: &str) -> anyhow::Result<RuntimeConfig> {
+pub fn parse_config(raw_yaml: &str) -> eyre::Result<RuntimeConfig> {
     let interpolated = interpolate_env(raw_yaml)?;
-    let settings: Config = serde_yaml_ng::from_str(&interpolated).context("invalid config")?;
+    let settings: Config = serde_yaml_ng::from_str(&interpolated).wrap_err("invalid config")?;
     validate(settings)
 }
 
-pub fn load_config(path: &str) -> anyhow::Result<RuntimeConfig> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read config file {path}"))?;
+pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
+    let raw = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("cannot read config file {path}"))?;
     parse_config(&raw)
 }
 
-fn validate(settings: Config) -> anyhow::Result<RuntimeConfig> {
+fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
     match settings.storage.backend {
         BackendKind::R2 if settings.storage.r2.is_none() => {
             bail!("storage.backend is r2 but storage.r2 is missing")
@@ -186,7 +186,7 @@ fn validate(settings: Config) -> anyhow::Result<RuntimeConfig> {
             bail!("invalid alias name {name:?}: alphanumeric, '-', '_' only (no dots)");
         }
         let upstream = parse_alias_upstream(&alias_cfg.upstream)
-            .map_err(|error| anyhow::anyhow!("alias {name}: {error}"))?;
+            .map_err(|error| eyre!("alias {name}: {error}"))?;
         if matches!(upstream, AliasUpstream::Classic { .. })
             && alias_cfg.auth == UpstreamAuthKind::Gcp
         {
@@ -210,7 +210,7 @@ fn validate(settings: Config) -> anyhow::Result<RuntimeConfig> {
     })
 }
 
-pub fn build_storage(cfg: &StorageConfig) -> anyhow::Result<Arc<dyn Storage>> {
+pub fn build_storage(cfg: &StorageConfig) -> eyre::Result<Arc<dyn Storage>> {
     use object_store::aws::AmazonS3Builder;
     use object_store::gcp::GoogleCloudStorageBuilder;
     use object_store::local::LocalFileSystem;
@@ -227,7 +227,7 @@ pub fn build_storage(cfg: &StorageConfig) -> anyhow::Result<Arc<dyn Storage>> {
                     .with_secret_access_key(&r2.secret_access_key)
                     .with_region("auto")
                     .build()
-                    .context("building R2 (S3) client")?,
+                    .wrap_err("building R2 (S3) client")?,
             )
         }
         BackendKind::Gcs => {
@@ -236,12 +236,12 @@ pub fn build_storage(cfg: &StorageConfig) -> anyhow::Result<Arc<dyn Storage>> {
             if let Some(key) = &gcs.service_account_key {
                 builder = builder.with_service_account_path(key);
             }
-            Arc::new(builder.build().context("building GCS client")?)
+            Arc::new(builder.build().wrap_err("building GCS client")?)
         }
         BackendKind::Local => {
             let local = cfg.local.as_ref().expect("validated");
             std::fs::create_dir_all(&local.path)
-                .with_context(|| format!("creating storage dir {}", local.path))?;
+                .wrap_err_with(|| format!("creating storage dir {}", local.path))?;
             Arc::new(LocalFileSystem::new_with_prefix(&local.path)?)
         }
         BackendKind::Memory => Arc::new(InMemory::new()),

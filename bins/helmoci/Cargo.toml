@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 helmoci-core.workspace = true
 helmoci-storage.workspace = true
-anyhow.workspace = true
+eyre.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true

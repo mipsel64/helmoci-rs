@@ -13,7 +13,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> eyre::Result<()> {
     let args = Args::parse();
     let rc = config::load_config(&args.config)?;
     let storage = config::build_storage(&rc.settings.storage)?;

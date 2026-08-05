@@ -18,7 +18,7 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(cfg: RuntimeConfig, storage: Arc<dyn Storage>) -> anyhow::Result<SharedState> {
+    pub fn new(cfg: RuntimeConfig, storage: Arc<dyn Storage>) -> eyre::Result<SharedState> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
@@ -134,7 +134,7 @@ impl Resolve for SystemDnsResolver {
     }
 }
 
-fn build_no_redirect_http<R: Resolve + 'static>(resolver: R) -> anyhow::Result<reqwest::Client> {
+fn build_no_redirect_http<R: Resolve + 'static>(resolver: R) -> eyre::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
@@ -146,14 +146,14 @@ fn build_no_redirect_http<R: Resolve + 'static>(resolver: R) -> anyhow::Result<r
 
 pub(crate) fn build_public_http<R: Resolve + 'static>(
     resolver: PublicDnsResolver<R>,
-) -> anyhow::Result<reqwest::Client> {
+) -> eyre::Result<reqwest::Client> {
     build_no_redirect_http(resolver)
 }
 
 #[cfg(test)]
 pub(crate) fn build_test_no_redirect_http<R: Resolve + 'static>(
     resolver: R,
-) -> anyhow::Result<reqwest::Client> {
+) -> eyre::Result<reqwest::Client> {
     build_no_redirect_http(resolver)
 }
 
