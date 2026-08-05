@@ -18,6 +18,9 @@ pub fn parse_oci_path(pathname: &str) -> OciRoute {
     let Some(rest) = path.strip_prefix("/v2") else {
         return OciRoute::NotFound;
     };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return OciRoute::NotFound;
+    }
     let rest = rest.trim_start_matches('/');
     if rest.is_empty() {
         return OciRoute::Api;
@@ -107,6 +110,19 @@ mod tests {
         assert_eq!(parse_oci_path("/v2/manifests/1.0"), OciRoute::NotFound);
         assert_eq!(parse_oci_path("/v2/x.io/manifests/a/b"), OciRoute::NotFound);
         assert_eq!(parse_oci_path("/v2/tags/list"), OciRoute::NotFound);
+    }
+
+    #[test]
+    fn rejects_non_boundary_v2_prefix() {
+        assert_eq!(
+            parse_oci_path("/v2evil/repo/manifests/tag"),
+            OciRoute::NotFound
+        );
+        assert_eq!(
+            parse_oci_path("/v2evil/repo/blobs/sha256:abc"),
+            OciRoute::NotFound
+        );
+        assert_eq!(parse_oci_path("/v2evil/repo/tags/list"), OciRoute::NotFound);
     }
 
     #[test]
