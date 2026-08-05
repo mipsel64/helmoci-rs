@@ -172,17 +172,18 @@ pub async fn fetch_token(
         .await?
         .send()
         .await
-        .map_err(|error| AppError::Upstream(format!("token request failed: {error}")))?;
+        .map_err(|error| {
+            AppError::Upstream(format!("token request failed: {}", error.without_url()))
+        })?;
     if !response.status().is_success() {
         return Err(AppError::Upstream(format!(
             "token endpoint returned HTTP {}",
             response.status().as_u16()
         )));
     }
-    let body: TokenResponse = response
-        .json()
-        .await
-        .map_err(|error| AppError::Upstream(format!("invalid token response: {error}")))?;
+    let body: TokenResponse = response.json().await.map_err(|error| {
+        AppError::Upstream(format!("invalid token response: {}", error.without_url()))
+    })?;
     body.token
         .or(body.access_token)
         .ok_or_else(|| AppError::Upstream("token response had no token".into()))
@@ -471,6 +472,29 @@ mod tests {
         assert!(matches!(error, crate::error::AppError::Upstream(_)));
         redirected.verify().await;
         registry.verify().await;
+    }
+
+    #[tokio::test]
+    async fn redacts_realm_query_secrets_from_transport_errors() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let registry = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let target = target(&registry, UpstreamAuthKind::None, true);
+        let challenge = BearerChallenge {
+            realm: format!("http://{registry}/token?client_secret=HELMOCI_REDACTION_SENTINEL"),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
+        let crate::error::AppError::Upstream(message) = error else {
+            panic!("transport failures should be upstream errors");
+        };
+
+        assert!(!message.contains("client_secret"), "{message}");
+        assert!(!message.contains("HELMOCI_REDACTION_SENTINEL"), "{message}");
     }
 
     #[tokio::test]
