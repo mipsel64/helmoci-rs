@@ -1,3 +1,6 @@
+// Each integration target uses a different subset of these shared helpers.
+#![allow(dead_code)]
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
