@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use helmoci_core::oci::{Digest, MEDIA_TYPE_MANIFEST, TagPointer};
-use helmoci_storage::{Blob, ObjectStoreStorage, Storage, TagScope, blob_key, tag_key};
+use helmoci_storage::{
+    Blob, EphemeralStorage, ObjectStoreStorage, Storage, TagScope, blob_key, tag_key,
+};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{
@@ -15,6 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::Notify;
 
@@ -84,6 +87,23 @@ async fn local_backend() {
     let dir = tempfile::tempdir().unwrap();
     let fs = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
     conformance(&ObjectStoreStorage::new(Arc::new(fs))).await;
+}
+
+#[tokio::test]
+async fn ephemeral_backend() {
+    conformance(&EphemeralStorage::new(1024 * 1024, Duration::from_secs(60))).await;
+}
+
+#[tokio::test]
+async fn ephemeral_expires_entries() {
+    let storage = EphemeralStorage::new(1024, Duration::from_millis(50));
+    let digest = Digest::sha256(b"x");
+    storage
+        .put_blob(&digest, "text/plain", Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(storage.get_blob(&digest).await.unwrap().is_none());
 }
 
 #[tokio::test]
