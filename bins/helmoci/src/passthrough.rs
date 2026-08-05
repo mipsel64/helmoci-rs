@@ -489,8 +489,32 @@ fn is_safe_uri_reference(reference: &str) -> bool {
     true
 }
 
+fn is_rfc_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn is_strict_tag_link_reference(reference: &str, target: &OciTarget) -> bool {
+    let first_segment_end = reference.find(['/', '?', '#']).unwrap_or(reference.len());
+    let first_segment = &reference[..first_segment_end];
+    let Some(scheme_end) = first_segment.find(':') else {
+        return !reference.starts_with("//");
+    };
+    let scheme = &reference[..scheme_end];
+    let remainder = &reference[scheme_end + 1..];
+    let expected_scheme = if target.plain_http { "http" } else { "https" };
+    if !is_rfc_scheme(scheme)
+        || !scheme.eq_ignore_ascii_case(expected_scheme)
+        || !remainder.starts_with("//")
+    {
+        return false;
+    }
+    !matches!(remainder.as_bytes().get(2), None | Some(b'/' | b'?' | b'#'))
+}
+
 fn resolved_tag_link_url(reference: &str, target: &OciTarget) -> Option<url::Url> {
-    if !is_safe_uri_reference(reference) {
+    if !is_safe_uri_reference(reference) || !is_strict_tag_link_reference(reference, target) {
         return None;
     }
     let target_url = upstream_url(target, "tags/list").ok()?;
@@ -985,6 +1009,30 @@ mod tests {
             ),
             Some("</v2/alias/x/tags/list?n=one%20two,three%2Cfour>; rel=next".into())
         );
+        for (link, expected) in [
+            (
+                "<HTTPS://registry.example/v2/x/tags/list?n=one>; rel=next",
+                "</v2/alias/x/tags/list?n=one>; rel=next",
+            ),
+            (
+                "<https://registry.example:443/v2/x/tags/list?n=one>; rel=next",
+                "</v2/alias/x/tags/list?n=one>; rel=next",
+            ),
+            (
+                "<?n=one,two>; rel=next",
+                "</v2/alias/x/tags/list?n=one,two>; rel=next",
+            ),
+            (
+                "<./list?n=one>; rel=next",
+                "</v2/alias/x/tags/list?n=one>; rel=next",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_tag_link(link, &target),
+                Some(expected.into()),
+                "{link}"
+            );
+        }
         for link in [
             "<http://registry.example/v2/x/tags/list?n=1>; rel=next",
             "<https://registry.example:444/v2/x/tags/list?n=1>; rel=next",
@@ -1030,6 +1078,31 @@ mod tests {
         ] {
             assert_eq!(rewrite_tag_link(&link, &target), None, "{link}");
         }
+    }
+
+    #[test]
+    fn tag_links_reject_repaired_absolute_urls() {
+        let https_target = target("registry.example", UpstreamAuthKind::None, false);
+        let path = "/v2/x/tags/list?n=one";
+        for reference in [
+            format!("https:/registry.example{path}"),
+            format!("https:registry.example{path}"),
+            format!("https:///registry.example{path}"),
+            format!("https:////registry.example{path}"),
+            format!("https://///registry.example{path}"),
+        ] {
+            let link = format!("<{reference}>; rel=next");
+            assert_eq!(rewrite_tag_link(&link, &https_target), None, "{reference}");
+        }
+
+        let plain_target = target("registry.example", UpstreamAuthKind::None, true);
+        assert_eq!(
+            rewrite_tag_link(
+                "<http:/registry.example/v2/x/tags/list?n=one>; rel=next",
+                &plain_target
+            ),
+            None
+        );
     }
 
     #[tokio::test]
