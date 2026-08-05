@@ -36,3 +36,22 @@ async fn non_v2_path_is_plain_404() {
     let (status, _, _) = common::send(&app, "GET", "/nope", "proxy.test").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn v2_lookalike_get_is_plain_404() {
+    let app = common::app(common::MEMORY_CFG);
+    let (status, headers, body) =
+        common::send(&app, "GET", "/v2evil/repo/manifests/tag", "proxy.test").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!headers.contains_key("Docker-Distribution-API-Version"));
+    assert_eq!(&body[..], b"Not Found");
+}
+
+#[tokio::test]
+async fn v2_lookalike_non_get_is_plain_404() {
+    let app = common::app(common::MEMORY_CFG);
+    let (status, headers, body) = common::send(&app, "POST", "/v20", "proxy.test").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!headers.contains_key("Docker-Distribution-API-Version"));
+    assert_eq!(&body[..], b"Not Found");
+}

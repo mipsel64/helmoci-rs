@@ -52,7 +52,7 @@ fn api_response() -> Response {
 
 async fn oci_dispatch(State(state): State<SharedState>, req: Request<Body>) -> Response {
     let path = req.uri().path().to_string();
-    if !path.starts_with("/v2") {
+    if path != "/v2" && !path.starts_with("/v2/") {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
     let head_only = match *req.method() {
