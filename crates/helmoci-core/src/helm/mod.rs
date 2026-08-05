@@ -1,5 +1,6 @@
 pub mod chart;
 pub mod index;
+pub mod rewrite;
 pub mod tgz;
 
 /// NotFound maps to 404; InvalidIndex/InvalidChart map to 502 at the server layer.
