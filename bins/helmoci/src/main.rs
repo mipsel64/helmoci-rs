@@ -17,11 +17,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .init();
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
     let args = Args::parse();
     let rc = config::load_config(&args.config)?;
     let storage = config::build_storage(&rc.settings.storage)?;
