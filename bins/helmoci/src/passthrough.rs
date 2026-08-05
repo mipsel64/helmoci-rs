@@ -402,13 +402,15 @@ fn valid_link_params(params: &str) -> bool {
 
         if bytes.get(position) == Some(&b'"') {
             position += 1;
+            let mut has_value = false;
             loop {
                 let Some(byte) = bytes.get(position) else {
                     return false;
                 };
                 position += 1;
                 match byte {
-                    b'"' => break,
+                    b'"' if has_value => break,
+                    b'"' => return false,
                     b'\\' => {
                         let Some(escaped) = bytes.get(position) else {
                             return false;
@@ -416,10 +418,11 @@ fn valid_link_params(params: &str) -> bool {
                         if *escaped < b' ' || *escaped == 0x7f {
                             return false;
                         }
+                        has_value = true;
                         position += 1;
                     }
                     byte if *byte < b' ' || *byte == 0x7f => return false,
-                    _ => {}
+                    _ => has_value = true,
                 }
             }
         } else {
@@ -436,6 +439,70 @@ fn valid_link_params(params: &str) -> bool {
     true
 }
 
+fn is_safe_uri_reference(reference: &str) -> bool {
+    let bytes = reference.as_bytes();
+    let mut position = 0;
+    while let Some(byte) = bytes.get(position) {
+        if !matches!(
+            byte,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b'%'
+        ) {
+            return false;
+        }
+        if *byte == b'%' {
+            let Some(encoded) = bytes.get(position + 1..position + 3) else {
+                return false;
+            };
+            if !encoded.iter().all(u8::is_ascii_hexdigit) {
+                return false;
+            }
+            position += 3;
+        } else {
+            position += 1;
+        }
+    }
+    true
+}
+
+fn resolved_tag_link_url(reference: &str, target: &OciTarget) -> Option<url::Url> {
+    if !is_safe_uri_reference(reference) {
+        return None;
+    }
+    let target_url = upstream_url(target, "tags/list").ok()?;
+    let resolved = url::Url::parse(reference)
+        .or_else(|_| target_url.join(reference))
+        .ok()?;
+    (resolved.origin() == target_url.origin()
+        && resolved.path() == target_url.path()
+        && resolved.fragment().is_none())
+    .then_some(resolved)
+}
+
 fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
     let link = link.trim_matches([' ', '\t']);
     if link
@@ -448,22 +515,8 @@ fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
     if !uri.1.is_empty() && !valid_link_params(uri.1) {
         return None;
     }
-    let upstream_path = format!("/v2/{}/tags/list", target.repo);
-    let query = if uri.0.starts_with('/') {
-        let (path, query) = uri.0.split_once('?').unwrap_or((uri.0, ""));
-        (path == upstream_path).then(|| query.to_string())?
-    } else {
-        let parsed = url::Url::parse(uri.0).ok()?;
-        let target_origin = url::Url::parse(&format!(
-            "{}://{}/",
-            if target.plain_http { "http" } else { "https" },
-            target.registry
-        ))
-        .ok()?
-        .origin();
-        (parsed.origin() == target_origin && parsed.path() == upstream_path)
-            .then(|| parsed.query().unwrap_or_default().to_string())?
-    };
+    let resolved = resolved_tag_link_url(uri.0, target)?;
+    let query = resolved.query().unwrap_or_default();
     let suffix = if query.is_empty() {
         String::new()
     } else {
@@ -925,6 +978,13 @@ mod tests {
             rewrite_tag_link(&format!("<{valid_path}>; rel=next; extension"), &target),
             Some("</v2/alias/x/tags/list?n=one,two>; rel=next; extension".into())
         );
+        assert_eq!(
+            rewrite_tag_link(
+                "</v2/x/tags/list?n=one%20two,three%2Cfour>; rel=next",
+                &target
+            ),
+            Some("</v2/alias/x/tags/list?n=one%20two,three%2Cfour>; rel=next".into())
+        );
         for link in [
             "<http://registry.example/v2/x/tags/list?n=1>; rel=next",
             "<https://registry.example:444/v2/x/tags/list?n=1>; rel=next",
@@ -943,10 +1003,30 @@ mod tests {
             format!("<{path}>;"),
             format!("<{path}>; =next"),
             format!("<{path}>; rel="),
+            format!("<{path}>; rel=\"\""),
             format!("<{path}>; title=\"unterminated"),
             format!("<{path}>; rel=next, bogus"),
             format!("<{path}>; rel=next, <{path}>; rel=prev"),
             format!("<{path}>; title=\"has\u{7}control\""),
+        ] {
+            assert_eq!(rewrite_tag_link(&link, &target), None, "{link}");
+        }
+    }
+
+    #[test]
+    fn tag_links_reject_unsafe_uri_references() {
+        let target = target("registry.example", UpstreamAuthKind::None, false);
+        let path = "/v2/x/tags/list";
+        for link in [
+            format!("<{path}?n=raw space>; rel=next"),
+            format!("<{path}?n=<foreign>; rel=next"),
+            format!("<{path}?n=raw>angle>; rel=next"),
+            format!("<{path}?n=back\\slash>; rel=next"),
+            format!("<{path}?n=control\u{7}>; rel=next"),
+            format!("<{path}?n=bad%ZZ>; rel=next"),
+            format!("<{path}?n=incomplete%2>; rel=next"),
+            format!("<{path}?n=one#fragment>; rel=next"),
+            format!("<https://registry.example{path}?n=one#fragment>; rel=next"),
         ] {
             assert_eq!(rewrite_tag_link(&link, &target), None, "{link}");
         }
