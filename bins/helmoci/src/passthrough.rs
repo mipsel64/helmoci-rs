@@ -1,12 +1,13 @@
 use crate::error::AppError;
 use crate::respond::bytes_response;
 use crate::state::AppState;
+use crate::upstream::{self, InitialClient};
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
-use futures::{Stream, StreamExt, TryStreamExt};
 use helmoci_core::oci::{Digest, MEDIA_TYPE_MANIFEST, TagPointer};
 use helmoci_core::resolver::{OciTarget, UpstreamAuthKind, is_public_hostname};
 use helmoci_storage::{Blob, TagScope};
@@ -112,13 +113,16 @@ async fn build_token_request(
     state: &AppState,
     target: &OciTarget,
     challenge: &BearerChallenge,
-) -> Result<reqwest::RequestBuilder, AppError> {
+) -> Result<(reqwest::Request, InitialClient), AppError> {
     let target_url = registry_url(target)?;
     let mut realm_url = url::Url::parse(&challenge.realm)
-        .map_err(|error| AppError::Upstream(format!("invalid registry token realm: {error}")))?;
-    if !matches!(realm_url.scheme(), "http" | "https") {
+        .map_err(|_| AppError::Upstream("invalid registry token realm".into()))?;
+    if !matches!(realm_url.scheme(), "http" | "https")
+        || !realm_url.username().is_empty()
+        || realm_url.password().is_some()
+    {
         return Err(AppError::Upstream(
-            "registry token realm must use http or https".into(),
+            "registry token realm must use http or https without userinfo".into(),
         ));
     }
     let same_origin = target_url.origin() == realm_url.origin();
@@ -144,16 +148,12 @@ async fn build_token_request(
                     "gcp registry token realm must use a public hostname".into(),
                 ));
             }
-            &state.public_http
+            InitialClient::Public
         }
-        UpstreamAuthKind::None if same_origin => &state.token_http,
+        UpstreamAuthKind::None if same_origin => InitialClient::TokenTrusted,
         UpstreamAuthKind::None => {
-            if !has_public_domain(&realm_url) {
-                return Err(AppError::Upstream(
-                    "cross-origin registry token realm must use a public hostname".into(),
-                ));
-            }
-            &state.public_http
+            upstream::validate_public_https(&realm_url)?;
+            InitialClient::Public
         }
     };
 
@@ -169,7 +169,7 @@ async fn build_token_request(
         );
     }
 
-    let mut request = client.get(realm_url);
+    let mut request = state.http.get(realm_url);
     if target.auth == UpstreamAuthKind::Gcp {
         let gcp = state.gcp.as_ref().ok_or_else(|| {
             AppError::Internal(
@@ -178,7 +178,10 @@ async fn build_token_request(
         })?;
         request = request.basic_auth("oauth2accesstoken", Some(gcp.access_token().await?));
     }
-    Ok(request)
+    let request = request.build().map_err(|error| {
+        AppError::Upstream(format!("invalid token request: {}", error.without_url()))
+    })?;
+    Ok((request, client))
 }
 
 pub async fn fetch_token(
@@ -186,22 +189,25 @@ pub async fn fetch_token(
     target: &OciTarget,
     challenge: &BearerChallenge,
 ) -> Result<String, AppError> {
-    let response = build_token_request(state, target, challenge)
-        .await?
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Upstream(format!("token request failed: {}", error.without_url()))
-        })?;
+    let (request, client) = build_token_request(state, target, challenge).await?;
+    let response = upstream::send(
+        state,
+        request.method().clone(),
+        request.url().clone(),
+        request.headers().clone(),
+        client,
+        true,
+    )
+    .await?;
     if !response.status().is_success() {
         return Err(AppError::Upstream(format!(
             "token endpoint returned HTTP {}",
             response.status().as_u16()
         )));
     }
-    let body: TokenResponse = response.json().await.map_err(|error| {
-        AppError::Upstream(format!("invalid token response: {}", error.without_url()))
-    })?;
+    let bytes = upstream::read_response(response, 1024 * 1024, "token response").await?;
+    let body: TokenResponse = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Upstream("invalid token response".into()))?;
     body.token
         .or(body.access_token)
         .ok_or_else(|| AppError::Upstream("token response had no token".into()))
@@ -289,44 +295,8 @@ fn accepts_media_type(accept: Option<&str>, media_type: &str) -> bool {
     })
 }
 
-async fn read_bounded<T>(
-    advertised_size: Option<u64>,
-    mut data: impl Stream<Item = Result<Bytes, T>> + Unpin,
-    max_bytes: u64,
-    map_error: impl Fn(T) -> AppError,
-) -> Result<Vec<u8>, AppError> {
-    if advertised_size.is_some_and(|size| size > max_bytes) {
-        return Err(AppError::TooLarge(format!(
-            "upstream response exceeds size limit ({max_bytes} bytes)"
-        )));
-    }
-    let capacity = advertised_size
-        .unwrap_or_default()
-        .min(max_bytes)
-        .min(64 * 1024)
-        .try_into()
-        .unwrap_or_default();
-    let mut bytes = Vec::with_capacity(capacity);
-    while let Some(chunk) = data.next().await {
-        let chunk = chunk.map_err(&map_error)?;
-        let accumulated = u64::try_from(bytes.len())
-            .ok()
-            .and_then(|size| size.checked_add(u64::try_from(chunk.len()).ok()?))
-            .ok_or_else(|| {
-                AppError::TooLarge(format!("response exceeds size limit ({max_bytes} bytes)"))
-            })?;
-        if accumulated > max_bytes {
-            return Err(AppError::TooLarge(format!(
-                "response exceeds size limit ({max_bytes} bytes)"
-            )));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
-}
-
 async fn read_cached_blob(blob: Blob, max_bytes: u64) -> Result<Vec<u8>, AppError> {
-    read_bounded(Some(blob.meta.size), blob.data, max_bytes, AppError::from).await
+    upstream::read_bounded(Some(blob.meta.size), blob.data, max_bytes, AppError::from).await
 }
 
 async fn read_upstream_body(
@@ -334,18 +304,7 @@ async fn read_upstream_body(
     max_bytes: u64,
     resource: &str,
 ) -> Result<Vec<u8>, AppError> {
-    read_bounded(
-        response.content_length(),
-        response.bytes_stream(),
-        max_bytes,
-        |error| {
-            AppError::Upstream(format!(
-                "reading upstream {resource} failed: {}",
-                error.without_url()
-            ))
-        },
-    )
-    .await
+    upstream::read_response(response, max_bytes, resource).await
 }
 
 fn is_link_token(byte: u8) -> bool {
@@ -597,23 +556,30 @@ pub async fn send_upstream(
 
     let url = upstream_url(target, suffix)?;
     let cache_key = upstream_token_cache_key(target);
-    let build = |token: Option<String>| {
-        let mut request = state.http.request(method.clone(), url.clone());
+    let build_headers = |token: Option<String>| {
+        let mut headers = reqwest::header::HeaderMap::new();
         if let Some(accept) = accept {
-            request = request.header(reqwest::header::ACCEPT, accept);
+            let value = reqwest::header::HeaderValue::from_str(accept)
+                .map_err(|_| AppError::Upstream("invalid upstream Accept header".into()))?;
+            headers.insert(reqwest::header::ACCEPT, value);
         }
         if let Some(token) = token {
-            request = request.bearer_auth(token);
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| AppError::Upstream("invalid upstream bearer token".into()))?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
         }
-        request
+        Ok::<_, AppError>(headers)
     };
 
-    let response = build(state.upstream_tokens.get(&cache_key).await)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
-        })?;
+    let response = upstream::send(
+        state,
+        method.clone(),
+        url.clone(),
+        build_headers(state.upstream_tokens.get(&cache_key).await)?,
+        InitialClient::Trusted,
+        true,
+    )
+    .await?;
     if response.status() != reqwest::StatusCode::UNAUTHORIZED {
         return Ok(response);
     }
@@ -631,9 +597,15 @@ pub async fn send_upstream(
     };
     let token = fetch_token(state, target, &challenge).await?;
     state.upstream_tokens.insert(cache_key, token.clone()).await;
-    build(Some(token)).send().await.map_err(|error| {
-        AppError::Upstream(format!("upstream request failed: {}", error.without_url()))
-    })
+    upstream::send(
+        state,
+        method,
+        url,
+        build_headers(Some(token))?,
+        InitialClient::Trusted,
+        true,
+    )
+    .await
 }
 
 pub async fn manifest(
@@ -868,7 +840,7 @@ pub async fn tags(
     }
     if !response.status().is_success() {
         return Err(AppError::Upstream(format!(
-            "upstream registry returned HTTP {} for {suffix}",
+            "upstream registry returned HTTP {} for tag list",
             response.status().as_u16()
         )));
     }
@@ -1449,12 +1421,11 @@ mod tests {
             scope: None,
         };
 
-        let request = build_token_request(&state, &target, &challenge)
+        let (request, client) = build_token_request(&state, &target, &challenge)
             .await
-            .unwrap()
-            .build()
             .unwrap();
 
+        assert_eq!(client, InitialClient::Public);
         assert_eq!(request.url().scheme(), "https");
         assert_eq!(request.url().host_str(), Some("registry.example"));
         assert_eq!(request.url().path(), "/token");
@@ -1563,5 +1534,154 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, crate::error::AppError::Upstream(_)));
+    }
+
+    #[tokio::test]
+    async fn token_response_rejects_advertised_and_streamed_bodies_over_one_mib() {
+        let server = MockServer::start().await;
+        let oversized = vec![b'a'; 1024 * 1024 + 1];
+        Mock::given(method("GET"))
+            .and(path("/advertised"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", oversized.len().to_string())
+                    .set_body_bytes(oversized.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/streamed"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("transfer-encoding", "chunked")
+                    .set_body_bytes(oversized),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+
+        for path in ["advertised", "streamed"] {
+            let challenge = BearerChallenge {
+                realm: format!("{}/{path}", server.uri()),
+                service: None,
+                scope: None,
+            };
+            let result = fetch_token(&state(), &target, &challenge).await;
+            assert!(matches!(result, Err(AppError::TooLarge(_))), "{path}");
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn configured_oci_redirect_to_private_origin_is_rejected_without_contact() {
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&private)
+            .await;
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/x/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/private", private.uri())),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let target = target(
+            registry.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+
+        let result = send_upstream(
+            &state(),
+            &target,
+            reqwest::Method::GET,
+            "manifests/latest",
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+        registry.verify().await;
+        private.verify().await;
+    }
+
+    #[tokio::test]
+    async fn configured_oci_same_origin_private_redirect_is_allowed() {
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/x/manifests/latest"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/moved"))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/moved"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let target = target(
+            registry.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+
+        let response = send_upstream(
+            &state(),
+            &target,
+            reqwest::Method::GET,
+            "manifests/latest",
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        registry.verify().await;
+    }
+
+    #[tokio::test]
+    async fn tag_failure_error_omits_upstream_query_values() {
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/x/tags/list"))
+            .and(query_param("signature", "OCI_QUERY_SENTINEL"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let target = target(
+            registry.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+
+        let error = tags(
+            &state(),
+            target,
+            Some("signature=OCI_QUERY_SENTINEL"),
+            false,
+        )
+        .await
+        .unwrap_err();
+        let AppError::Upstream(message) = error else {
+            panic!("tag failure should be an upstream error")
+        };
+
+        assert!(!message.contains("signature"), "{message}");
+        assert!(!message.contains("OCI_QUERY_SENTINEL"), "{message}");
+        registry.verify().await;
     }
 }

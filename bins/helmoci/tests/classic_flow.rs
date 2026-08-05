@@ -252,3 +252,75 @@ async fn metadata_less_local_storage_validates_digest_manifests() {
     let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(error["errors"][0]["code"], "MANIFEST_UNKNOWN");
 }
+
+#[tokio::test]
+async fn upstream_failure_responses_do_not_expose_url_credentials_or_queries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/index.yaml"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let server_uri = server.uri();
+    let authority = server_uri.trim_start_matches("http://");
+    let upstream = format!(
+        "http://INDEX_USER_SENTINEL:INDEX_PASSWORD_SENTINEL@{authority}?token=INDEX_QUERY_SENTINEL"
+    );
+    let app = common::app(&cfg(&upstream));
+
+    let (status, _, body) =
+        common::send(&app, "GET", "/v2/test/demo/manifests/1.0.0", "proxy.test").await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    for secret in [
+        "INDEX_USER_SENTINEL",
+        "INDEX_PASSWORD_SENTINEL",
+        "INDEX_QUERY_SENTINEL",
+        authority,
+    ] {
+        assert!(!body.contains(secret), "response leaked {secret:?}: {body}");
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn chart_failure_responses_do_not_expose_signed_urls_or_userinfo() {
+    let server = MockServer::start().await;
+    let server_uri = server.uri();
+    let authority = server_uri.trim_start_matches("http://");
+    let chart_url = format!(
+        "http://CHART_USER_SENTINEL:CHART_PASSWORD_SENTINEL@{authority}/demo.tgz?signature=CHART_QUERY_SENTINEL"
+    );
+    Mock::given(method("GET"))
+        .and(path("/index.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "entries:\n  demo:\n    - version: 1.0.0\n      urls: [\"{chart_url}\"]\n"
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/demo.tgz"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let app = common::app(&cfg(&server.uri()));
+
+    let (status, _, body) =
+        common::send(&app, "GET", "/v2/test/demo/manifests/1.0.0", "proxy.test").await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    for secret in [
+        "CHART_USER_SENTINEL",
+        "CHART_PASSWORD_SENTINEL",
+        "CHART_QUERY_SENTINEL",
+        &chart_url,
+    ] {
+        assert!(!body.contains(secret), "response leaked {secret:?}: {body}");
+    }
+    server.verify().await;
+}

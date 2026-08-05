@@ -30,11 +30,13 @@ impl AppState {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let public_http = build_public_http(PublicDnsResolver::new(SystemDnsResolver))?;
         let token_http = build_token_http()?;
         let index_cache = moka::future::Cache::builder()
-            .max_capacity(512)
+            .weigher(|_key: &String, text: &Arc<String>| text.len().try_into().unwrap_or(u32::MAX))
+            .max_capacity(cfg.settings.max_chart_bytes)
             .time_to_live(Duration::from_secs(cfg.settings.index_cache_ttl_secs))
             .build();
         let upstream_tokens = moka::future::Cache::builder()
@@ -181,6 +183,7 @@ pub(crate) fn build_test_no_redirect_http<R: Resolve + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{build_storage, parse_config};
     use std::net::SocketAddr;
 
     struct StaticResolver(SocketAddr);
@@ -286,5 +289,25 @@ mod tests {
             .collect();
 
         assert_eq!(result, vec![address]);
+    }
+
+    #[tokio::test]
+    async fn index_cache_capacity_is_weighted_by_text_bytes() {
+        let cfg = parse_config("storage:\n  type: memory\nmax_chart_bytes: 8\n").unwrap();
+        let storage = build_storage(&cfg.settings.storage).unwrap();
+        let state = AppState::new(cfg, storage, None).unwrap();
+
+        state
+            .index_cache
+            .insert("one".into(), Arc::new("12345".into()))
+            .await;
+        state
+            .index_cache
+            .insert("two".into(), Arc::new("67890".into()))
+            .await;
+        state.index_cache.run_pending_tasks().await;
+
+        assert!(state.index_cache.weighted_size() <= 8);
+        assert_eq!(state.index_cache.entry_count(), 1);
     }
 }

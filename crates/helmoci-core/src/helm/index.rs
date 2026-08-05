@@ -15,20 +15,19 @@ pub struct ChartEntry {
 
 pub fn chart_entries(
     index_text: &str,
-    repo_url: &str,
+    _repo_url: &str,
     chart_name: &str,
 ) -> Result<Vec<ChartEntry>, HelmError> {
     let index: ChartIndex = serde_yaml_ng::from_str(index_text).map_err(|_| {
-        HelmError::InvalidIndex(format!(
-            "Upstream {repo_url} did not return a valid Helm index.yaml. \
-             Check that the path maps to a classic Helm repo."
-        ))
+        HelmError::InvalidIndex(
+            "Upstream did not return a valid Helm index.yaml. Check that the path maps to a classic Helm repo."
+                .into(),
+        )
     })?;
     let Some(entries) = index.entries else {
-        return Err(HelmError::InvalidIndex(format!(
-            "No Helm chart index found at {repo_url}. \
-             Expected {repo_url}/index.yaml with an \"entries\" map."
-        )));
+        return Err(HelmError::InvalidIndex(
+            "Upstream index.yaml did not contain an \"entries\" map.".into(),
+        ));
     };
     match entries.get(chart_name) {
         Some(list) if !list.is_empty() => Ok(list.clone()),
@@ -43,7 +42,7 @@ pub fn chart_entries(
                 format!(" Charts in this repo include: {}{more}.", shown.join(", "))
             };
             Err(HelmError::NotFound(format!(
-                "Chart \"{chart_name}\" was not found in {repo_url}.{hint} \
+                "Chart \"{chart_name}\" was not found.{hint} \
                  The chart name is the last path segment."
             )))
         }
@@ -81,25 +80,27 @@ pub fn resolve_chart_url(
         .find(|e| e.version.as_deref() == Some(version))
         .ok_or_else(|| {
             HelmError::NotFound(format!(
-                "Version \"{version}\" was not found for chart \"{chart_name}\" in {repo_url}. \
+                "Version \"{version}\" was not found for chart \"{chart_name}\". \
                  List available versions: GET /v2/<name>/tags/list"
             ))
         })?;
     let raw = entry.urls.as_ref().and_then(|u| u.first()).ok_or_else(|| {
         HelmError::NotFound(format!(
-            "Chart \"{chart_name}\" version \"{version}\" in {repo_url} \
+            "Chart \"{chart_name}\" version \"{version}\" \
                  has no download URL in index.yaml."
         ))
     })?;
-    if raw.starts_with("http://") || raw.starts_with("https://") {
-        Ok(raw.clone())
-    } else {
-        Ok(format!(
-            "{}/{}",
-            repo_url.trim_end_matches('/'),
-            raw.trim_start_matches('/')
-        ))
+    let mut base = url::Url::parse(repo_url)
+        .map_err(|_| HelmError::InvalidIndex("Configured Helm repository URL is invalid".into()))?;
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
     }
+    base.join(raw).map(|url| url.to_string()).map_err(|_| {
+        HelmError::InvalidIndex(format!(
+            "Chart \"{chart_name}\" version \"{version}\" has an invalid download URL"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -174,5 +175,26 @@ entries:
             list_versions("apiVersion: v1", REPO, "demo").unwrap_err(),
             HelmError::InvalidIndex(_)
         ));
+    }
+
+    #[test]
+    fn index_errors_never_include_repository_credentials_or_query() {
+        let repo =
+            "https://USER_SENTINEL:PASSWORD_SENTINEL@repo.example/stable?token=QUERY_SENTINEL";
+        for error in [
+            list_versions(": bad [", repo, "demo").unwrap_err(),
+            list_versions("entries: {}", repo, "CHART_HINT").unwrap_err(),
+            resolve_chart_url(INDEX, repo, "demo", "VERSION_HINT").unwrap_err(),
+        ] {
+            let message = error.to_string();
+            for secret in [
+                "USER_SENTINEL",
+                "PASSWORD_SENTINEL",
+                "QUERY_SENTINEL",
+                "repo.example",
+            ] {
+                assert!(!message.contains(secret), "{message}");
+            }
+        }
     }
 }

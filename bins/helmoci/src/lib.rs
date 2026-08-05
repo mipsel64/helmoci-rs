@@ -8,3 +8,4 @@ pub mod passthrough;
 pub mod respond;
 pub mod routes;
 pub mod state;
+pub(crate) mod upstream;
