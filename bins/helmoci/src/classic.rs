@@ -50,7 +50,7 @@ pub async fn fetch_index_text(
     let http = http_client(state, &index_url, source)?;
     if let Some(text) = state.index_cache.get(&cache_key).await {
         metrics::counter!("helmoci_index_cache_hits_total").increment(1);
-        tracing::debug!(url = %index_url, "index cache hit");
+        tracing::debug!("index cache hit");
         return Ok(text);
     }
 
@@ -219,7 +219,7 @@ pub async fn manifest(
         && let Some(blob) = store.get_blob(&ptr.digest).await?
     {
         metrics::counter!("helmoci_manifest_cache_hits_total").increment(1);
-        tracing::info!(name = %chart.full_name, tag = reference, "manifest cache hit");
+        tracing::info!("manifest cache hit");
         return Ok(blob_response(&ptr.media_type, &ptr.digest, blob, head_only));
     }
 
@@ -231,7 +231,7 @@ pub async fn manifest(
         reference,
     )
     .map_err(AppError::from_helm_for_manifest)?;
-    tracing::info!(url = %chart_url, repo = %chart.repo_url, "manifest cache miss, fetching");
+    tracing::info!("manifest cache miss, fetching");
     let tgz = download_chart(state, &chart_url, chart.source).await?;
 
     let ctx = RewriteContext {
@@ -251,8 +251,8 @@ pub async fn manifest(
         .await
         .map_err(|e| AppError::Internal(format!("chart build task failed: {e}")))?
         .map_err(AppError::from_helm_for_manifest)?;
-    for r in &rewrites {
-        tracing::info!(dep = %r.name, from = %r.from, to = %r.to, "rewrote dependency");
+    if !rewrites.is_empty() {
+        tracing::info!(count = rewrites.len(), "rewrote dependencies");
     }
 
     tokio::try_join!(
@@ -375,9 +375,12 @@ mod tests {
         AppState, PublicDnsResolver, SharedState, build_public_http, build_test_no_redirect_http,
         build_token_http,
     };
+    use helmoci_core::helm::tgz::testutil::build_chart_tgz;
     use helmoci_storage::EphemeralStorage;
     use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::io::Write;
     use std::net::SocketAddr;
+    use std::sync::Mutex;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -422,6 +425,129 @@ mod tests {
 
     fn state_with_public_http(public_http: reqwest::Client) -> SharedState {
         state_with_clients(reqwest::Client::new(), public_http)
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn classic_tracing_omits_request_and_upstream_details() {
+        let server = MockServer::start().await;
+        let address = server.address();
+        let repo_url = format!(
+            "http://REPO_USER_SENTINEL:REPO_PASSWORD_SENTINEL@{address}/repo?token=REPO_QUERY_SENTINEL"
+        );
+        let chart_url = format!(
+            "http://CHART_USER_SENTINEL:CHART_PASSWORD_SENTINEL@{address}/demo.tgz?signature=CHART_SIGNATURE_SENTINEL"
+        );
+        let reference = "REQUEST_TAG_SENTINEL";
+        let index = format!(
+            "entries:\n  demo:\n    - name: demo\n      version: {reference}\n      urls: [\"{chart_url}\"]\n"
+        );
+        Mock::given(method("GET"))
+            .and(path("/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(index))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let chart_yaml = concat!(
+            "name: demo\nversion: 1.0.0\ndependencies:\n",
+            "  - name: DEP_NAME_SENTINEL\n    version: 1.0.0\n",
+            "    repository: https://DEP_USER_SENTINEL:DEP_PASSWORD_SENTINEL@charts.example.com/private/DEP_PATH_SENTINEL?token=DEP_QUERY_SENTINEL\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/demo.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(build_chart_tgz(&[("demo/Chart.yaml", chart_yaml)])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || SharedWriter(writer_output.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let state = state();
+        let chart = ClassicChart {
+            repo_url: repo_url.clone(),
+            chart_name: "demo".to_string(),
+            full_name: "alias/REQUEST_NAME_SENTINEL".to_string(),
+            ephemeral: false,
+            source: ClassicSource::ConfiguredAlias,
+        };
+
+        manifest(
+            &state,
+            "PROXY_HOST_SENTINEL",
+            chart.clone(),
+            reference,
+            false,
+        )
+        .await
+        .unwrap();
+        fetch_index_text(&state, &repo_url, ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap();
+        manifest(&state, "PROXY_HOST_SENTINEL", chart, reference, false)
+            .await
+            .unwrap();
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for event in [
+            "index cache hit",
+            "manifest cache hit",
+            "manifest cache miss, fetching",
+            "rewrote dependenc",
+        ] {
+            assert!(logs.contains(event), "missing event {event:?}: {logs}");
+        }
+        for secret in [
+            "REPO_USER_SENTINEL",
+            "REPO_PASSWORD_SENTINEL",
+            "REPO_QUERY_SENTINEL",
+            "CHART_USER_SENTINEL",
+            "CHART_PASSWORD_SENTINEL",
+            "CHART_SIGNATURE_SENTINEL",
+            "DEP_USER_SENTINEL",
+            "DEP_PASSWORD_SENTINEL",
+            "DEP_PATH_SENTINEL",
+            "DEP_QUERY_SENTINEL",
+            "DEP_NAME_SENTINEL",
+            "PROXY_HOST_SENTINEL",
+            "REQUEST_NAME_SENTINEL",
+            "REQUEST_TAG_SENTINEL",
+        ] {
+            assert!(!logs.contains(secret), "logs leaked {secret:?}: {logs}");
+        }
+        for raw_url in [&repo_url, &chart_url] {
+            assert!(
+                !logs.contains(raw_url),
+                "logs leaked URL {raw_url:?}: {logs}"
+            );
+        }
+        for scheme in ["http://", "https://", "oci://"] {
+            assert!(!logs.contains(scheme), "logs leaked a URL: {logs}");
+        }
+        server.verify().await;
     }
 
     #[tokio::test]
