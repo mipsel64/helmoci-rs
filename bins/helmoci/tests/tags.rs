@@ -6,7 +6,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cfg(server_uri: &str) -> String {
     format!(
-        "storage:\n  backend: memory\naliases:\n  test:\n    upstream: {server_uri}\n    store: true\n"
+        "storage:\n  type: memory\naliases:\n  test:\n    upstream: {server_uri}\n    store: true\n"
     )
 }
 

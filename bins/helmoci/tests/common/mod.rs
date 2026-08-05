@@ -8,7 +8,7 @@ use helmoci::state::{AppState, SharedState};
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
 
-pub const MEMORY_CFG: &str = "storage:\n  backend: memory\n";
+pub const MEMORY_CFG: &str = "storage:\n  type: memory\n";
 
 pub fn test_state(cfg_yaml: &str) -> SharedState {
     let rc = parse_config(cfg_yaml).expect("test config parses");

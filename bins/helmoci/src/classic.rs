@@ -379,7 +379,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn state() -> SharedState {
-        let rc = parse_config("storage:\n  backend: memory\nmax_chart_bytes: 1024\n").unwrap();
+        let rc = parse_config("storage:\n  type: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
         AppState::new(rc, storage).unwrap()
     }
@@ -394,7 +394,7 @@ mod tests {
     }
 
     fn state_with_clients(http: reqwest::Client, public_http: reqwest::Client) -> SharedState {
-        let rc = parse_config("storage:\n  backend: memory\nmax_chart_bytes: 1024\n").unwrap();
+        let rc = parse_config("storage:\n  type: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
         let index_cache = moka::future::Cache::builder().max_capacity(32).build();
         let ephemeral = Arc::new(EphemeralStorage::new(1024, Duration::from_secs(60)));

@@ -14,7 +14,7 @@ const CHART_YAML: &str = concat!(
 fn cfg(server_uri: &str) -> String {
     format!(
         concat!(
-            "storage:\n  backend: memory\n",
+            "storage:\n  type: memory\n",
             "max_chart_bytes: 65536\n",
             "aliases:\n",
             "  test:\n    upstream: {uri}\n    store: true\n",
@@ -216,7 +216,7 @@ async fn metadata_less_local_storage_validates_digest_manifests() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = format!(
         concat!(
-            "storage:\n  backend: local\n  local:\n    path: {path}\n",
+            "storage:\n  type: local\n  settings:\n    path: {path}\n",
             "max_chart_bytes: 65536\n",
             "aliases:\n  test:\n    upstream: {uri}\n    store: true\n",
         ),

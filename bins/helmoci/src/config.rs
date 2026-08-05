@@ -39,7 +39,7 @@ pub struct Config {
     pub index_cache_ttl_secs: u64,
     #[serde(default)]
     pub ephemeral_cache: EphemeralCacheConfig,
-    pub storage: StorageConfig,
+    pub storage: Backend,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -64,22 +64,18 @@ impl Default for EphemeralCacheConfig {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendKind {
-    R2,
-    Gcs,
-    Local,
-    Memory,
-}
-
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StorageConfig {
-    pub backend: BackendKind,
-    pub r2: Option<R2Config>,
-    pub gcs: Option<GcsConfig>,
-    pub local: Option<LocalConfig>,
+#[serde(
+    tag = "type",
+    content = "settings",
+    rename_all = "lowercase",
+    deny_unknown_fields
+)]
+pub enum Backend {
+    R2(R2Config),
+    Gcs(GcsConfig),
+    Local(LocalConfig),
+    Memory,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,18 +160,6 @@ pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
 }
 
 fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
-    match settings.storage.backend {
-        BackendKind::R2 if settings.storage.r2.is_none() => {
-            bail!("storage.backend is r2 but storage.r2 is missing")
-        }
-        BackendKind::Gcs if settings.storage.gcs.is_none() => {
-            bail!("storage.backend is gcs but storage.gcs is missing")
-        }
-        BackendKind::Local if settings.storage.local.is_none() => {
-            bail!("storage.backend is local but storage.local is missing")
-        }
-        _ => {}
-    }
     if settings.auth.enabled && !settings.auth.tokens.iter().any(|token| !token.is_empty()) {
         bail!("auth.enabled is true but auth.tokens has no non-empty token");
     }
@@ -210,41 +194,36 @@ fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
     })
 }
 
-pub fn build_storage(cfg: &StorageConfig) -> eyre::Result<Arc<dyn Storage>> {
+pub fn build_storage(cfg: &Backend) -> eyre::Result<Arc<dyn Storage>> {
     use object_store::aws::AmazonS3Builder;
     use object_store::gcp::GoogleCloudStorageBuilder;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
 
-    let store: Arc<dyn object_store::ObjectStore> = match cfg.backend {
-        BackendKind::R2 => {
-            let r2 = cfg.r2.as_ref().expect("validated");
-            Arc::new(
-                AmazonS3Builder::new()
-                    .with_endpoint(&r2.endpoint)
-                    .with_bucket_name(&r2.bucket)
-                    .with_access_key_id(&r2.access_key_id)
-                    .with_secret_access_key(&r2.secret_access_key)
-                    .with_region("auto")
-                    .build()
-                    .wrap_err("building R2 (S3) client")?,
-            )
-        }
-        BackendKind::Gcs => {
-            let gcs = cfg.gcs.as_ref().expect("validated");
+    let store: Arc<dyn object_store::ObjectStore> = match cfg {
+        Backend::R2(r2) => Arc::new(
+            AmazonS3Builder::new()
+                .with_endpoint(&r2.endpoint)
+                .with_bucket_name(&r2.bucket)
+                .with_access_key_id(&r2.access_key_id)
+                .with_secret_access_key(&r2.secret_access_key)
+                .with_region("auto")
+                .build()
+                .wrap_err("building R2 (S3) client")?,
+        ),
+        Backend::Gcs(gcs) => {
             let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(&gcs.bucket);
             if let Some(key) = &gcs.service_account_key {
                 builder = builder.with_service_account_path(key);
             }
             Arc::new(builder.build().wrap_err("building GCS client")?)
         }
-        BackendKind::Local => {
-            let local = cfg.local.as_ref().expect("validated");
+        Backend::Local(local) => {
             std::fs::create_dir_all(&local.path)
                 .wrap_err_with(|| format!("creating storage dir {}", local.path))?;
             Arc::new(LocalFileSystem::new_with_prefix(&local.path)?)
         }
-        BackendKind::Memory => Arc::new(InMemory::new()),
+        Backend::Memory => Arc::new(InMemory::new()),
     };
     Ok(Arc::new(ObjectStoreStorage::new(store)))
 }
@@ -253,7 +232,50 @@ pub fn build_storage(cfg: &StorageConfig) -> eyre::Result<Arc<dyn Storage>> {
 mod tests {
     use super::*;
 
-    const MINIMAL: &str = "storage:\n  backend: memory\n";
+    const MINIMAL: &str = "storage:\n  type: memory\n";
+
+    #[test]
+    fn tagged_backends_deserialize() {
+        let memory = parse_config(MINIMAL).unwrap();
+        assert!(matches!(memory.settings.storage, Backend::Memory));
+
+        let local =
+            parse_config("storage:\n  type: local\n  settings:\n    path: /tmp/helmoci\n").unwrap();
+        let Backend::Local(local) = local.settings.storage else {
+            panic!("expected local backend")
+        };
+        assert_eq!(local.path, "/tmp/helmoci");
+
+        let r2 = parse_config(concat!(
+            "storage:\n  type: r2\n  settings:\n",
+            "    endpoint: https://r2.example\n    bucket: charts\n",
+            "    access_key_id: key\n    secret_access_key: secret\n",
+        ))
+        .unwrap();
+        assert!(matches!(r2.settings.storage, Backend::R2(_)));
+
+        let gcs = parse_config(concat!(
+            "storage:\n  type: gcs\n  settings:\n",
+            "    bucket: charts\n    service_account_key: /tmp/key.json\n",
+        ))
+        .unwrap();
+        assert!(matches!(gcs.settings.storage, Backend::Gcs(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_backend_shapes() {
+        for yaml in [
+            concat!("storage:\n  back", "end: memory\n"),
+            "storage:\n  type: local\n",
+            "storage:\n  type: memory\n  settings:\n    path: /tmp\n",
+            "storage:\n  type: local\n  settings:\n    path: /tmp\n    typo: true\n",
+        ] {
+            assert!(
+                parse_config(yaml).is_err(),
+                "unexpectedly accepted:\n{yaml}"
+            );
+        }
+    }
 
     #[test]
     fn minimal_config_gets_defaults() {
@@ -268,39 +290,38 @@ mod tests {
     #[test]
     fn interpolates_env_vars() {
         unsafe { std::env::set_var("HELMOCI_TEST_TOKEN", "s3cret") };
-        let yaml = "storage:\n  backend: memory\nauth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_TOKEN}\"]\n";
+        let yaml = "storage:\n  type: memory\nauth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_TOKEN}\"]\n";
         let rc = parse_config(yaml).unwrap();
         assert_eq!(rc.settings.auth.tokens, vec!["s3cret"]);
     }
 
     #[test]
     fn missing_env_var_fails() {
-        let yaml =
-            "storage:\n  backend: memory\nauth:\n  tokens: [\"${HELMOCI_DOES_NOT_EXIST}\"]\n";
+        let yaml = "storage:\n  type: memory\nauth:\n  tokens: [\"${HELMOCI_DOES_NOT_EXIST}\"]\n";
         assert!(parse_config(yaml).is_err());
     }
 
     #[test]
     fn rejects_unknown_fields_and_bad_config() {
-        assert!(parse_config("storage:\n  backend: memory\ntypo_field: 1\n").is_err());
-        assert!(parse_config("storage:\n  backend: r2\n").is_err());
+        assert!(parse_config("storage:\n  type: memory\ntypo_field: 1\n").is_err());
+        assert!(parse_config("storage:\n  type: r2\n").is_err());
         assert!(
             parse_config(
-                "storage:\n  backend: memory\naliases:\n  bad.name:\n    upstream: https://x.io\n"
+                "storage:\n  type: memory\naliases:\n  bad.name:\n    upstream: https://x.io\n"
             )
             .is_err()
         );
         assert!(parse_config(
-            "storage:\n  backend: memory\naliases:\n  a:\n    upstream: https://x.io\n    auth: gcp\n"
+            "storage:\n  type: memory\naliases:\n  a:\n    upstream: https://x.io\n    auth: gcp\n"
         )
         .is_err());
-        assert!(parse_config("storage:\n  backend: memory\nauth:\n  enabled: true\n").is_err());
+        assert!(parse_config("storage:\n  type: memory\nauth:\n  enabled: true\n").is_err());
     }
 
     #[test]
     fn builds_alias_tables() {
         let yaml = concat!(
-            "storage:\n  backend: memory\n",
+            "storage:\n  type: memory\n",
             "aliases:\n",
             "  argo:\n    upstream: https://argoproj.github.io/argo-helm\n    store: true\n",
             "  meteora:\n    upstream: oci://asia-docker.pkg.dev/meteora-ops/charts\n    auth: gcp\n",
