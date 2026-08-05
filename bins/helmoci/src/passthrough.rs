@@ -1,22 +1,24 @@
 use crate::error::AppError;
-use crate::respond::{blob_response, bytes_response};
+use crate::respond::bytes_response;
 use crate::state::AppState;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use futures::{Stream, StreamExt, TryStreamExt};
 use helmoci_core::oci::{Digest, MEDIA_TYPE_MANIFEST, TagPointer};
 use helmoci_core::resolver::{OciTarget, UpstreamAuthKind, is_public_hostname};
 use helmoci_storage::{Blob, TagScope};
 
 const DEFAULT_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
      application/vnd.oci.image.index.v1+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
+     application/vnd.docker.distribution.manifest.v2+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
 
 #[derive(Debug, PartialEq)]
 pub struct BearerChallenge {
@@ -230,7 +232,12 @@ fn header_str(response: &reqwest::Response, name: &str) -> Option<String> {
 fn is_manifest_media_type(content_type: &str) -> bool {
     matches!(
         content_type.split(';').next().map(str::trim),
-        Some(MEDIA_TYPE_MANIFEST | OCI_INDEX_MEDIA_TYPE | DOCKER_MANIFEST_MEDIA_TYPE)
+        Some(
+            MEDIA_TYPE_MANIFEST
+                | OCI_INDEX_MEDIA_TYPE
+                | DOCKER_MANIFEST_MEDIA_TYPE
+                | DOCKER_MANIFEST_LIST_MEDIA_TYPE
+        )
     )
 }
 
@@ -242,21 +249,120 @@ fn manifest_media_type(bytes: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn buffered_blob(blob: Blob) -> Result<Vec<u8>, AppError> {
-    let mut bytes = Vec::with_capacity(blob.meta.size as usize);
-    let mut data = blob.data;
+fn accepts_media_type(accept: Option<&str>, media_type: &str) -> bool {
+    accept.is_none_or(|accept| {
+        accept.split(',').any(|range| {
+            let mut parts = range.split(';');
+            let range = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+            let acceptable = parts.all(|parameter| {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    return true;
+                };
+                !name.trim().eq_ignore_ascii_case("q")
+                    || value
+                        .trim()
+                        .parse::<f32>()
+                        .is_ok_and(|quality| quality > 0.0)
+            });
+            acceptable
+                && (range == "*/*"
+                    || range == media_type
+                    || range
+                        .strip_suffix("/*")
+                        .is_some_and(|kind| media_type.starts_with(&format!("{kind}/"))))
+        })
+    })
+}
+
+async fn read_bounded<T>(
+    advertised_size: Option<u64>,
+    mut data: impl Stream<Item = Result<Bytes, T>> + Unpin,
+    max_bytes: u64,
+    map_error: impl Fn(T) -> AppError,
+) -> Result<Vec<u8>, AppError> {
+    if advertised_size.is_some_and(|size| size > max_bytes) {
+        return Err(AppError::TooLarge(format!(
+            "upstream response exceeds size limit ({max_bytes} bytes)"
+        )));
+    }
+    let capacity = advertised_size
+        .unwrap_or_default()
+        .min(max_bytes)
+        .min(64 * 1024)
+        .try_into()
+        .unwrap_or_default();
+    let mut bytes = Vec::with_capacity(capacity);
     while let Some(chunk) = data.next().await {
-        bytes.extend_from_slice(&chunk?);
+        let chunk = chunk.map_err(&map_error)?;
+        let accumulated = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|size| size.checked_add(u64::try_from(chunk.len()).ok()?))
+            .ok_or_else(|| {
+                AppError::TooLarge(format!("response exceeds size limit ({max_bytes} bytes)"))
+            })?;
+        if accumulated > max_bytes {
+            return Err(AppError::TooLarge(format!(
+                "response exceeds size limit ({max_bytes} bytes)"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+async fn read_cached_blob(blob: Blob, max_bytes: u64) -> Result<Vec<u8>, AppError> {
+    read_bounded(Some(blob.meta.size), blob.data, max_bytes, AppError::from).await
+}
+
+async fn read_upstream_body(
+    response: reqwest::Response,
+    max_bytes: u64,
+    resource: &str,
+) -> Result<Vec<u8>, AppError> {
+    read_bounded(
+        response.content_length(),
+        response.bytes_stream(),
+        max_bytes,
+        |error| {
+            AppError::Upstream(format!(
+                "reading upstream {resource} failed: {}",
+                error.without_url()
+            ))
+        },
+    )
+    .await
+}
+
+fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
+    let link = link.trim();
+    let uri = link.strip_prefix('<')?.split_once('>')?;
+    let upstream_path = format!("/v2/{}/tags/list", target.repo);
+    let path_and_query = if uri.0.starts_with('/') {
+        uri.0.to_string()
+    } else {
+        let parsed = url::Url::parse(uri.0).ok()?;
+        match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_string(),
+        }
+    };
+    let suffix = path_and_query.strip_prefix(&upstream_path)?;
+    if !suffix.is_empty() && !suffix.starts_with('?') {
+        return None;
+    }
+    Some(format!(
+        "</v2/{}/tags/list{}>{}",
+        target.full_name, suffix, uri.1
+    ))
 }
 
 async fn cached_manifest_response(
     digest: &Digest,
     blob: Blob,
     head_only: bool,
+    max_bytes: u64,
 ) -> Result<Response, AppError> {
-    let bytes = buffered_blob(blob).await?;
+    let bytes = read_cached_blob(blob, max_bytes).await?;
     if Digest::sha256(&bytes) != *digest {
         return Err(AppError::ManifestUnknown(format!(
             "manifest unknown: {digest}"
@@ -307,8 +413,13 @@ pub async fn send_upstream(
         return Ok(response);
     }
 
-    let challenge_header = header_str(&response, "www-authenticate").unwrap_or_default();
-    let Some(challenge) = parse_bearer_challenge(&challenge_header) else {
+    let challenge = response
+        .headers()
+        .get_all("www-authenticate")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(parse_bearer_challenge);
+    let Some(challenge) = challenge else {
         return Err(AppError::Upstream(
             "upstream returned 401 without a usable bearer challenge".into(),
         ));
@@ -328,10 +439,11 @@ pub async fn manifest(
     head_only: bool,
     accept: Option<String>,
 ) -> Result<Response, AppError> {
+    let max_bytes = state.cfg.settings.max_chart_bytes;
     if target.store {
         if let Some(digest) = Digest::parse(reference) {
             if let Some(blob) = state.storage.get_blob(&digest).await? {
-                return cached_manifest_response(&digest, blob, head_only).await;
+                return cached_manifest_response(&digest, blob, head_only, max_bytes).await;
             }
         } else {
             let scope = TagScope {
@@ -340,9 +452,10 @@ pub async fn manifest(
             };
             if let Some(pointer) = state.storage.get_tag_pointer(&scope, reference).await?
                 && is_manifest_media_type(&pointer.media_type)
+                && accepts_media_type(accept.as_deref(), &pointer.media_type)
                 && let Some(blob) = state.storage.get_blob(&pointer.digest).await?
             {
-                return cached_manifest_response(&pointer.digest, blob, head_only).await;
+                return cached_manifest_response(&pointer.digest, blob, head_only, max_bytes).await;
             }
         }
     }
@@ -387,17 +500,15 @@ pub async fn manifest(
         if let Some(digest) = header_str(&response, "docker-content-digest") {
             builder = builder.header("Docker-Content-Digest", digest);
         }
+        if let Some(etag) = header_str(&response, "etag") {
+            builder = builder.header(header::ETAG, etag);
+        }
         return Ok(builder
             .body(Body::empty())
             .expect("static headers are valid"));
     }
 
-    let bytes = response.bytes().await.map_err(|error| {
-        AppError::Upstream(format!(
-            "reading upstream manifest failed: {}",
-            error.without_url()
-        ))
-    })?;
+    let bytes = read_upstream_body(response, max_bytes, "manifest").await?;
     let digest = Digest::sha256(&bytes);
     if let Some(requested_digest) = Digest::parse(reference)
         && requested_digest != digest
@@ -414,7 +525,7 @@ pub async fn manifest(
     if target.store {
         state
             .storage
-            .put_blob(&digest, &media_type, bytes.clone())
+            .put_blob(&digest, &media_type, bytes.clone().into())
             .await?;
         if Digest::parse(reference).is_none() {
             let scope = TagScope {
@@ -454,7 +565,11 @@ pub async fn blob(
             .content_type
             .clone()
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        return Ok(blob_response(&content_type, &digest, blob, head_only));
+        if let Ok(bytes) = read_cached_blob(blob, state.cfg.settings.max_chart_bytes).await
+            && Digest::sha256(&bytes) == digest
+        {
+            return Ok(bytes_response(&content_type, &digest, bytes, head_only));
+        }
     }
 
     let method = if head_only {
@@ -474,6 +589,7 @@ pub async fn blob(
     }
     let content_type = header_str(&response, "content-type")
         .unwrap_or_else(|| "application/octet-stream".to_string());
+    let etag = header_str(&response, "etag");
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, &content_type)
@@ -482,6 +598,9 @@ pub async fn blob(
     if head_only {
         if let Some(length) = response.content_length() {
             builder = builder.header(header::CONTENT_LENGTH, length);
+        }
+        if let Some(etag) = etag {
+            builder = builder.header(header::ETAG, etag);
         }
         return Ok(builder
             .body(Body::empty())
@@ -494,12 +613,8 @@ pub async fn blob(
             .map(|length| length <= state.cfg.settings.max_chart_bytes)
             .unwrap_or(false);
     if cacheable {
-        let bytes = response.bytes().await.map_err(|error| {
-            AppError::Upstream(format!(
-                "reading upstream blob failed: {}",
-                error.without_url()
-            ))
-        })?;
+        let bytes =
+            read_upstream_body(response, state.cfg.settings.max_chart_bytes, "blob").await?;
         if Digest::sha256(&bytes) != digest {
             return Err(AppError::Upstream(format!(
                 "upstream blob bytes did not match requested digest {digest}"
@@ -507,7 +622,7 @@ pub async fn blob(
         }
         state
             .storage
-            .put_blob(&digest, &content_type, bytes.clone())
+            .put_blob(&digest, &content_type, bytes.clone().into())
             .await?;
         return Ok(bytes_response(
             &content_type,
@@ -518,6 +633,9 @@ pub async fn blob(
     }
     if let Some(length) = response.content_length() {
         builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    if let Some(etag) = etag {
+        builder = builder.header(header::ETAG, etag);
     }
     let data: BoxStream<'static, Result<Bytes, std::io::Error>> =
         Box::pin(response.bytes_stream().map_err(std::io::Error::other));
@@ -536,12 +654,7 @@ pub async fn tags(
         Some(query) => format!("tags/list?{query}"),
         None => "tags/list".to_string(),
     };
-    let method = if head_only {
-        reqwest::Method::HEAD
-    } else {
-        reqwest::Method::GET
-    };
-    let response = send_upstream(state, &target, method, &suffix, None).await?;
+    let response = send_upstream(state, &target, reqwest::Method::GET, &suffix, None).await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(AppError::NameUnknown(format!(
             "upstream repository unknown: {}",
@@ -554,45 +667,35 @@ pub async fn tags(
             response.status().as_u16()
         )));
     }
-    let link = header_str(&response, "link").map(|link| {
-        link.replace(
-            &format!("/v2/{}/", target.repo),
-            &format!("/v2/{}/", target.full_name),
-        )
-    });
+    let link = header_str(&response, "link").and_then(|link| rewrite_tag_link(&link, &target));
+    let bytes =
+        read_upstream_body(response, state.cfg.settings.max_chart_bytes, "tag list").await?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Upstream("upstream tag list was not valid JSON".into()))?;
+    if !value.is_object() {
+        return Err(AppError::Upstream(
+            "upstream tag list was not a JSON object".into(),
+        ));
+    }
+    value["name"] = serde_json::Value::String(target.full_name);
+    let body = serde_json::to_vec(&value)
+        .map_err(|_| AppError::Internal("encoding rewritten tag list failed".into()))?;
+    let etag = Digest::sha256(&body);
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::ETAG, format!("\"{etag}\""))
         .header("Docker-Distribution-API-Version", "registry/2.0");
     if let Some(link) = link {
         builder = builder.header(header::LINK, link);
     }
-    if head_only {
-        if let Some(length) = response.content_length() {
-            builder = builder.header(header::CONTENT_LENGTH, length);
-        }
-        return Ok(builder
-            .body(Body::empty())
-            .expect("static headers are valid"));
-    }
-
-    let bytes = response.bytes().await.map_err(|error| {
-        AppError::Upstream(format!(
-            "reading upstream tag list failed: {}",
-            error.without_url()
-        ))
-    })?;
-    let body = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(mut value) => {
-            value["name"] = serde_json::Value::String(target.full_name);
-            value.to_string()
-        }
-        Err(_) => String::from_utf8_lossy(&bytes).into_owned(),
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from(body)
     };
-    builder = builder.header(header::CONTENT_LENGTH, body.len());
-    Ok(builder
-        .body(Body::from(body))
-        .expect("static headers are valid"))
+    Ok(builder.body(body).expect("static headers are valid"))
 }
 
 #[cfg(test)]
@@ -646,6 +749,24 @@ mod tests {
             auth,
             plain_http,
         }
+    }
+
+    #[test]
+    fn accept_ranges_match_exact_type_wildcard_and_any() {
+        let media_type = "application/vnd.oci.image.index.v1+json";
+        assert!(accepts_media_type(Some(media_type), media_type));
+        assert!(accepts_media_type(Some("application/*"), media_type));
+        assert!(accepts_media_type(Some("APPLICATION/*"), media_type));
+        assert!(accepts_media_type(Some("*/*"), media_type));
+        assert!(accepts_media_type(
+            Some("application/json, application/vnd.oci.image.index.v1+json;q=0.8"),
+            media_type
+        ));
+        assert!(!accepts_media_type(
+            Some("application/vnd.oci.image.manifest.v1+json"),
+            media_type
+        ));
+        assert!(!accepts_media_type(Some("*/*;q=0"), media_type));
     }
 
     #[tokio::test]

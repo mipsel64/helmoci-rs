@@ -72,6 +72,10 @@ pub fn is_valid_chart_name(s: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
+fn is_valid_oci_repo_segment(s: &str) -> bool {
+    is_valid_chart_name(s)
+}
+
 /// Alias names must not look like hostnames: no dots allowed.
 pub fn is_valid_alias_name(s: &str) -> bool {
     let mut bytes = s.bytes();
@@ -153,7 +157,11 @@ pub fn resolve_name(name: &str, aliases: &HashMap<String, Alias>) -> Option<Reso
                 }))
             }
             AliasUpstream::Oci { registry, repo } => {
-                if segments.len() < 2 {
+                if segments.len() < 2
+                    || !segments[1..]
+                        .iter()
+                        .all(|segment| is_valid_oci_repo_segment(segment))
+                {
                     return None;
                 }
                 Some(Resolved::Oci(OciTarget {
@@ -318,6 +326,25 @@ mod tests {
             })
         );
         assert!(resolve_name("meteora", &aliases()).is_none());
+    }
+
+    #[test]
+    fn oci_aliases_reject_decoded_path_escapes_but_allow_nesting() {
+        for name in [
+            "meteora/./chart",
+            "meteora/../private",
+            "meteora/nested/../private",
+            "meteora/nested\\private",
+            "meteora/nested?private",
+            "meteora/nested#private",
+            "meteora/nested\u{1f}private",
+        ] {
+            assert!(resolve_name(name, &aliases()).is_none(), "{name:?}");
+        }
+        assert!(matches!(
+            resolve_name("meteora/team/nested/chart.v2", &aliases()),
+            Some(Resolved::Oci(_))
+        ));
     }
 
     #[test]

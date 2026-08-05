@@ -3,7 +3,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use bytes::Bytes;
 use helmoci::config::{build_storage, parse_config};
 use helmoci::gcp::GcpTokenProvider;
@@ -42,12 +42,28 @@ pub async fn send(
     path: &str,
     host: &str,
 ) -> (StatusCode, HeaderMap, Bytes) {
-    let req = Request::builder()
+    send_with_headers(app, method, path, host, &[]).await
+}
+
+pub async fn send_with_headers(
+    app: &Router,
+    method: &str,
+    path: &str,
+    host: &str,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut req = Request::builder()
         .method(method)
         .uri(path)
         .header("host", host)
         .body(Body::empty())
         .unwrap();
+    for (name, value) in extra_headers {
+        req.headers_mut().insert(
+            name.parse::<HeaderName>().unwrap(),
+            value.parse::<HeaderValue>().unwrap(),
+        );
+    }
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
