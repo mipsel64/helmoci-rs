@@ -1,3 +1,4 @@
+use crate::classic;
 use crate::error::AppError;
 use crate::state::SharedState;
 use axum::Router;
@@ -7,6 +8,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use helmoci_core::oci::route::{OciRoute, parse_oci_path};
+use helmoci_core::resolver::{Resolved, resolve_name};
 
 pub fn build_router(state: SharedState) -> Router {
     Router::new()
@@ -60,13 +62,53 @@ async fn oci_dispatch(State(state): State<SharedState>, req: Request<Body>) -> R
         Method::HEAD => true,
         _ => return AppError::Unsupported("only GET/HEAD are supported".into()).into_response(),
     };
-    let _ = (proxy_host_from(req.headers()), head_only, &state);
+    let proxy_host = proxy_host_from(req.headers());
+    let query = req.uri().query().map(str::to_string);
 
-    match parse_oci_path(&path) {
-        OciRoute::Api => api_response(),
-        OciRoute::Manifest { .. } | OciRoute::Blob { .. } | OciRoute::Tags { .. } => {
-            AppError::NameUnknown("not implemented yet".into()).into_response()
+    let result = match parse_oci_path(&path) {
+        OciRoute::Api => Ok(api_response()),
+        OciRoute::Manifest { name, reference } => {
+            manifest_entry(&state, &proxy_host, &name, &reference, head_only).await
         }
-        OciRoute::NotFound => AppError::NameUnknown("unknown registry path".into()).into_response(),
+        OciRoute::Blob { name, digest } => blob_entry(&state, &name, &digest, head_only).await,
+        OciRoute::Tags { name } => {
+            let _ = (&name, &query);
+            Err(AppError::NameUnknown("not implemented yet".into()))
+        }
+        OciRoute::NotFound => Err(AppError::NameUnknown("unknown registry path".into())),
+    };
+    result.unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn manifest_entry(
+    state: &SharedState,
+    proxy_host: &str,
+    name: &str,
+    reference: &str,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    match resolve_name(name, &state.cfg.aliases) {
+        Some(Resolved::Classic(chart)) => {
+            classic::manifest(state, proxy_host, chart, reference, head_only).await
+        }
+        Some(Resolved::Oci(_)) => Err(AppError::Internal(
+            "oci pass-through is wired in a later task".into(),
+        )),
+        None => Err(AppError::NameUnknown(invalid_path_message(name))),
+    }
+}
+
+async fn blob_entry(
+    state: &SharedState,
+    name: &str,
+    digest: &str,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    match resolve_name(name, &state.cfg.aliases) {
+        Some(Resolved::Classic(_)) => classic::blob(state, digest, head_only).await,
+        Some(Resolved::Oci(_)) => Err(AppError::Internal(
+            "oci pass-through is wired in a later task".into(),
+        )),
+        None => Err(AppError::NameUnknown(invalid_path_message(name))),
     }
 }
