@@ -3,8 +3,9 @@ use super::{
     OciManifest, TagPointer,
 };
 use crate::helm::HelmError;
-use crate::helm::chart::chart_config_from_tgz;
-use crate::helm::rewrite::{Rewrite, RewriteContext, rewrite_chart_dependencies};
+use crate::helm::chart::chart_config_from_tgz_with_limits;
+use crate::helm::rewrite::{Rewrite, RewriteContext, rewrite_chart_dependencies_with_limits};
+use crate::helm::tgz::ArchiveLimits;
 
 pub struct BuiltChart {
     pub manifest_bytes: Vec<u8>,
@@ -21,14 +22,22 @@ pub fn build_helm_oci_chart(
     chart_tgz: Vec<u8>,
     ctx: &RewriteContext,
 ) -> Result<BuiltChart, HelmError> {
-    let rewritten = rewrite_chart_dependencies(&chart_tgz, ctx)?;
+    build_helm_oci_chart_with_limits(chart_tgz, ctx, ArchiveLimits::default())
+}
+
+pub fn build_helm_oci_chart_with_limits(
+    chart_tgz: Vec<u8>,
+    ctx: &RewriteContext,
+    limits: ArchiveLimits,
+) -> Result<BuiltChart, HelmError> {
+    let rewritten = rewrite_chart_dependencies_with_limits(&chart_tgz, ctx, limits)?;
     let layer_bytes = if rewritten.modified {
         rewritten.tgz
     } else {
         chart_tgz
     };
 
-    let config_bytes = chart_config_from_tgz(&layer_bytes)?;
+    let config_bytes = chart_config_from_tgz_with_limits(&layer_bytes, limits)?;
     let config_digest = Digest::sha256(&config_bytes);
     let layer_digest = Digest::sha256(&layer_bytes);
 
@@ -108,5 +117,20 @@ mod tests {
         let built = build_helm_oci_chart(tgz.clone(), &ctx()).unwrap();
         assert_eq!(built.rewrites.len(), 1);
         assert_ne!(built.layer_digest, Digest::sha256(&tgz));
+    }
+
+    #[test]
+    fn bounded_build_rejects_oversized_archive_entry() {
+        let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
+        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+
+        let error = build_helm_oci_chart_with_limits(tgz, &ctx(), limits)
+            .err()
+            .expect("expected archive limit error");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid chart archive: regular file exceeds per-file limit (5 > 4 bytes)"
+        );
     }
 }

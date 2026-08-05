@@ -1,9 +1,16 @@
 use super::HelmError;
-use super::tgz::{is_root_chart_file, unpack_tgz};
+use super::tgz::{ArchiveLimits, is_root_chart_file, unpack_tgz_with_limits};
 
 /// Root Chart.yaml re-encoded as JSON — the OCI config blob for a Helm chart.
 pub fn chart_config_from_tgz(tgz: &[u8]) -> Result<Vec<u8>, HelmError> {
-    let files = unpack_tgz(tgz)?;
+    chart_config_from_tgz_with_limits(tgz, ArchiveLimits::default())
+}
+
+pub fn chart_config_from_tgz_with_limits(
+    tgz: &[u8],
+    limits: ArchiveLimits,
+) -> Result<Vec<u8>, HelmError> {
+    let files = unpack_tgz_with_limits(tgz, limits)?;
     let chart = files
         .iter()
         .find(|f| is_root_chart_file(&f.name, "Chart.yaml"))
@@ -54,5 +61,18 @@ mod tests {
             chart_config_from_tgz(&tgz).unwrap_err(),
             HelmError::InvalidChart(_)
         ));
+    }
+
+    #[test]
+    fn bounded_chart_config_rejects_oversized_archive_entry() {
+        let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
+        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+
+        let error = chart_config_from_tgz_with_limits(&tgz, limits).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid chart archive: regular file exceeds per-file limit (5 > 4 bytes)"
+        );
     }
 }

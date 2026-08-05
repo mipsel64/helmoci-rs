@@ -1,5 +1,5 @@
 use super::HelmError;
-use super::tgz::{is_root_chart_file, pack_tgz, unpack_tgz};
+use super::tgz::{ArchiveLimits, is_root_chart_file, pack_tgz, unpack_tgz_with_limits};
 use crate::resolver::{is_public_hostname, normalize_repo_key};
 use serde_yaml_ng::Value;
 use std::collections::HashMap;
@@ -56,6 +56,14 @@ pub fn rewrite_chart_dependencies(
     tgz: &[u8],
     ctx: &RewriteContext,
 ) -> Result<RewriteResult, HelmError> {
+    rewrite_chart_dependencies_with_limits(tgz, ctx, ArchiveLimits::default())
+}
+
+pub fn rewrite_chart_dependencies_with_limits(
+    tgz: &[u8],
+    ctx: &RewriteContext,
+    limits: ArchiveLimits,
+) -> Result<RewriteResult, HelmError> {
     fn unmodified(tgz: &[u8]) -> RewriteResult {
         RewriteResult {
             tgz: tgz.to_vec(),
@@ -67,7 +75,7 @@ pub fn rewrite_chart_dependencies(
     if ctx.proxy_host.is_empty() {
         return Ok(unmodified(tgz));
     }
-    let mut files = unpack_tgz(tgz)?;
+    let mut files = unpack_tgz_with_limits(tgz, limits)?;
     let Some(chart_idx) = files
         .iter()
         .position(|f| is_root_chart_file(&f.name, "Chart.yaml"))
@@ -237,7 +245,7 @@ mod tests {
             "oci://proxy.test/charts.bitnami.com/bitnami"
         );
 
-        let files = unpack_tgz(&result.tgz).unwrap();
+        let files = unpack_tgz_with_limits(&result.tgz, ArchiveLimits::default()).unwrap();
         let chart = files.iter().find(|f| f.name == "demo/Chart.yaml").unwrap();
         let value: Value = serde_yaml_ng::from_str(&String::from_utf8_lossy(&chart.data)).unwrap();
         let deps = value["dependencies"].as_sequence().unwrap();
@@ -268,5 +276,20 @@ mod tests {
         let result = rewrite_chart_dependencies(&tgz, &ctx()).unwrap();
         assert!(!result.modified);
         assert_eq!(result.tgz, tgz);
+    }
+
+    #[test]
+    fn bounded_rewrite_rejects_oversized_archive_entry() {
+        let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
+        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+
+        let error = rewrite_chart_dependencies_with_limits(&tgz, &ctx(), limits)
+            .err()
+            .expect("expected archive limit error");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid chart archive: regular file exceeds per-file limit (5 > 4 bytes)"
+        );
     }
 }
