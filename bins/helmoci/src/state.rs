@@ -12,6 +12,7 @@ pub struct AppState {
     pub ephemeral: Arc<EphemeralStorage>,
     pub http: reqwest::Client,
     pub public_http: reqwest::Client,
+    pub token_http: reqwest::Client,
     pub index_cache: moka::future::Cache<String, Arc<String>>,
     pub gcp: Option<Arc<dyn crate::gcp::GcpTokenProvider>>,
     /// Bearer tokens for upstream registries, keyed by registry|repo.
@@ -31,6 +32,7 @@ impl AppState {
             .timeout(Duration::from_secs(120))
             .build()?;
         let public_http = build_public_http(PublicDnsResolver::new(SystemDnsResolver))?;
+        let token_http = build_token_http()?;
         let index_cache = moka::future::Cache::builder()
             .max_capacity(512)
             .time_to_live(Duration::from_secs(cfg.settings.index_cache_ttl_secs))
@@ -49,6 +51,7 @@ impl AppState {
             ephemeral,
             http,
             public_http,
+            token_http,
             index_cache,
             gcp,
             upstream_tokens,
@@ -161,6 +164,10 @@ pub(crate) fn build_public_http<R: Resolve + 'static>(
     resolver: PublicDnsResolver<R>,
 ) -> eyre::Result<reqwest::Client> {
     build_no_redirect_http(resolver)
+}
+
+pub(crate) fn build_token_http() -> eyre::Result<reqwest::Client> {
+    build_no_redirect_http(SystemDnsResolver)
 }
 
 #[cfg(test)]

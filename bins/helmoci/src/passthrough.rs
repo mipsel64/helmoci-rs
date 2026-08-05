@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::state::AppState;
-use helmoci_core::resolver::UpstreamAuthKind;
+use helmoci_core::resolver::{OciTarget, UpstreamAuthKind, is_public_hostname};
 
 #[derive(Debug, PartialEq)]
 pub struct BearerChallenge {
@@ -11,20 +11,30 @@ pub struct BearerChallenge {
 
 /// Parse `Bearer realm="…",service="…",scope="…"`.
 pub fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
-    let rest = header.trim().strip_prefix("Bearer ")?;
+    let parts = split_challenge_params(header.trim());
+    let bearer_index = parts
+        .iter()
+        .position(|part| strip_prefix_ascii_case(part, "Bearer ").is_some())?;
     let mut realm = None;
     let mut service = None;
     let mut scope = None;
-    for part in split_challenge_params(rest) {
+    for (index, part) in parts.iter().enumerate().skip(bearer_index) {
+        let part = if index == bearer_index {
+            strip_prefix_ascii_case(part, "Bearer ")?
+        } else {
+            part
+        };
         let Some((key, value)) = part.split_once('=') else {
             continue;
         };
         let value = value.trim().trim_matches('"').to_string();
-        match key.trim() {
-            "realm" => realm = Some(value),
-            "service" => service = Some(value),
-            "scope" => scope = Some(value),
-            _ => {}
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("realm") {
+            realm = Some(value);
+        } else if key.eq_ignore_ascii_case("service") {
+            service = Some(value);
+        } else if key.eq_ignore_ascii_case("scope") {
+            scope = Some(value);
         }
     }
     Some(BearerChallenge {
@@ -32,6 +42,13 @@ pub fn parse_bearer_challenge(header: &str) -> Option<BearerChallenge> {
         service,
         scope,
     })
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())?
+        .eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
 }
 
 fn split_challenge_params(value: &str) -> Vec<String> {
@@ -63,28 +80,79 @@ struct TokenResponse {
     access_token: Option<String>,
 }
 
-pub async fn fetch_token(
+fn registry_url(target: &OciTarget) -> Result<url::Url, AppError> {
+    let scheme = if target.plain_http { "http" } else { "https" };
+    url::Url::parse(&format!("{scheme}://{}", target.registry))
+        .map_err(|_| AppError::Upstream("invalid OCI registry authority".into()))
+}
+
+fn has_public_domain(url: &url::Url) -> bool {
+    matches!(url.host(), Some(url::Host::Domain(host)) if is_public_hostname(host))
+}
+
+async fn build_token_request(
     state: &AppState,
+    target: &OciTarget,
     challenge: &BearerChallenge,
-    auth: &UpstreamAuthKind,
-    fallback_scope: &str,
-) -> Result<String, AppError> {
-    let mut url = url::Url::parse(&challenge.realm).map_err(|error| {
-        AppError::Upstream(format!("invalid token realm {}: {error}", challenge.realm))
-    })?;
+) -> Result<reqwest::RequestBuilder, AppError> {
+    let target_url = registry_url(target)?;
+    let mut realm_url = url::Url::parse(&challenge.realm)
+        .map_err(|error| AppError::Upstream(format!("invalid registry token realm: {error}")))?;
+    if !matches!(realm_url.scheme(), "http" | "https") {
+        return Err(AppError::Upstream(
+            "registry token realm must use http or https".into(),
+        ));
+    }
+    let same_origin = target_url.origin() == realm_url.origin();
+    let client = match target.auth {
+        UpstreamAuthKind::Gcp => {
+            if target.plain_http {
+                return Err(AppError::Upstream(
+                    "gcp registry authentication requires an HTTPS target".into(),
+                ));
+            }
+            if realm_url.scheme() != "https" {
+                return Err(AppError::Upstream(
+                    "gcp registry token realm must use HTTPS".into(),
+                ));
+            }
+            if !same_origin {
+                return Err(AppError::Upstream(
+                    "gcp registry token realm must match the registry origin".into(),
+                ));
+            }
+            if !has_public_domain(&target_url) || !has_public_domain(&realm_url) {
+                return Err(AppError::Upstream(
+                    "gcp registry token realm must use a public hostname".into(),
+                ));
+            }
+            &state.public_http
+        }
+        UpstreamAuthKind::None if same_origin => &state.token_http,
+        UpstreamAuthKind::None => {
+            if !has_public_domain(&realm_url) {
+                return Err(AppError::Upstream(
+                    "cross-origin registry token realm must use a public hostname".into(),
+                ));
+            }
+            &state.public_http
+        }
+    };
+
+    let fallback_scope = format!("repository:{}:pull", target.repo);
     {
-        let mut query = url.query_pairs_mut();
+        let mut query = realm_url.query_pairs_mut();
         if let Some(service) = &challenge.service {
             query.append_pair("service", service);
         }
         query.append_pair(
             "scope",
-            challenge.scope.as_deref().unwrap_or(fallback_scope),
+            challenge.scope.as_deref().unwrap_or(&fallback_scope),
         );
     }
 
-    let mut request = state.http.get(url);
-    if *auth == UpstreamAuthKind::Gcp {
+    let mut request = client.get(realm_url);
+    if target.auth == UpstreamAuthKind::Gcp {
         let gcp = state.gcp.as_ref().ok_or_else(|| {
             AppError::Internal(
                 "alias requires gcp auth but GCP credentials were not initialized".into(),
@@ -92,8 +160,16 @@ pub async fn fetch_token(
         })?;
         request = request.basic_auth("oauth2accesstoken", Some(gcp.access_token().await?));
     }
+    Ok(request)
+}
 
-    let response = request
+pub async fn fetch_token(
+    state: &AppState,
+    target: &OciTarget,
+    challenge: &BearerChallenge,
+) -> Result<String, AppError> {
+    let response = build_token_request(state, target, challenge)
+        .await?
         .send()
         .await
         .map_err(|error| AppError::Upstream(format!("token request failed: {error}")))?;
@@ -120,26 +196,49 @@ mod tests {
     use crate::state::{AppState, SharedState};
     use async_trait::async_trait;
     use base64::Engine;
-    use helmoci_core::resolver::UpstreamAuthKind;
+    use helmoci_core::resolver::{OciTarget, UpstreamAuthKind};
     use std::sync::Arc;
-    use wiremock::matchers::{header, method, path, query_param};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    struct FakeGcp;
+    struct CountingGcp {
+        calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
-    impl GcpTokenProvider for FakeGcp {
+    impl GcpTokenProvider for CountingGcp {
         async fn access_token(&self) -> Result<String, crate::error::AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("fake-gcp-token".to_string())
         }
     }
 
-    fn state(gcp: bool) -> SharedState {
+    fn state() -> SharedState {
         let rc = parse_config("storage:\n  type: memory\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
-        let gcp: Option<Arc<dyn GcpTokenProvider>> =
-            if gcp { Some(Arc::new(FakeGcp)) } else { None };
-        AppState::new(rc, storage, gcp).unwrap()
+        AppState::new(rc, storage, None).unwrap()
+    }
+
+    fn counting_gcp_state() -> (SharedState, Arc<AtomicUsize>) {
+        let rc = parse_config("storage:\n  type: memory\n").unwrap();
+        let storage = build_storage(&rc.settings.storage).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn GcpTokenProvider> = Arc::new(CountingGcp {
+            calls: calls.clone(),
+        });
+        (AppState::new(rc, storage, Some(provider)).unwrap(), calls)
+    }
+
+    fn target(registry: impl Into<String>, auth: UpstreamAuthKind, plain_http: bool) -> OciTarget {
+        OciTarget {
+            registry: registry.into(),
+            repo: "x".into(),
+            full_name: "alias/x".into(),
+            store: false,
+            auth,
+            plain_http,
+        }
     }
 
     #[test]
@@ -160,6 +259,220 @@ mod tests {
         assert!(parse_bearer_challenge("Bearer service=\"no-realm\"").is_none());
     }
 
+    #[test]
+    fn parses_mixed_case_bearer_scheme_and_parameter_names() {
+        let challenge = parse_bearer_challenge(
+            "bEaReR ReAlM=\"https://auth.example/token\",SeRvIcE=\"reg.example\",ScOpE=\"repository:a/b:pull\"",
+        )
+        .unwrap();
+
+        assert_eq!(challenge.realm, "https://auth.example/token");
+        assert_eq!(challenge.service.as_deref(), Some("reg.example"));
+        assert_eq!(challenge.scope.as_deref(), Some("repository:a/b:pull"));
+    }
+
+    #[test]
+    fn finds_bearer_challenge_after_another_challenge() {
+        let challenge = parse_bearer_challenge(
+            "Basic realm=\"legacy\", Bearer realm=\"https://auth.example/token\",service=\"reg.example\"",
+        )
+        .unwrap();
+
+        assert_eq!(challenge.realm, "https://auth.example/token");
+        assert_eq!(challenge.service.as_deref(), Some("reg.example"));
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_gcp_target_before_obtaining_a_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-not-be-returned"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, calls) = counting_gcp_state();
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::Gcp,
+            true,
+        );
+        let challenge = BearerChallenge {
+            realm: format!(
+                "https://{}/token",
+                server.uri().trim_start_matches("http://")
+            ),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state, &target, &challenge).await.unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_gcp_realm_before_obtaining_a_token() {
+        let (state, calls) = counting_gcp_state();
+        let target = target("registry.example", UpstreamAuthKind::Gcp, false);
+        let challenge = BearerChallenge {
+            realm: "http://registry.example/token".into(),
+            service: None,
+            scope: None,
+        };
+
+        let error = build_token_request(&state, &target, &challenge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_gcp_realm_before_obtaining_a_token() {
+        let (state, calls) = counting_gcp_state();
+        let target = target("registry.example", UpstreamAuthKind::Gcp, false);
+        let challenge = BearerChallenge {
+            realm: "https://auth.example/token".into(),
+            service: None,
+            scope: None,
+        };
+
+        let error = build_token_request(&state, &target, &challenge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_private_anonymous_realm_without_contact() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-not-be-returned"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let target = target("registry.example", UpstreamAuthKind::None, false);
+        let challenge = BearerChallenge {
+            realm: format!("http://localhost:{}/token", server.address().port()),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_ip_literal_anonymous_realm_without_contact() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-not-be-returned"
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let target = target("registry.example", UpstreamAuthKind::None, false);
+        let challenge = BearerChallenge {
+            realm: format!("{}/token", server.uri()),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn preserves_same_origin_local_anonymous_token_flow() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .and(query_param("scope", "repository:x:pull"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "local-token"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+        let challenge = BearerChallenge {
+            realm: format!("{}/token", server.uri()),
+            service: None,
+            scope: None,
+        };
+
+        let token = fetch_token(&state(), &target, &challenge).await.unwrap();
+
+        assert_eq!(token, "local-token");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_anonymous_token_redirects() {
+        let redirected = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "redirected-token"
+            })))
+            .expect(0)
+            .mount(&redirected)
+            .await;
+        let registry = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/token", redirected.uri())),
+            )
+            .expect(1)
+            .mount(&registry)
+            .await;
+        let target = target(
+            registry.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
+        let challenge = BearerChallenge {
+            realm: format!("{}/redirect", registry.uri()),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, crate::error::AppError::Upstream(_)));
+        redirected.verify().await;
+        registry.verify().await;
+    }
+
     #[tokio::test]
     async fn fetches_anonymous_token_with_service_and_fallback_scope() {
         let server = MockServer::start().await;
@@ -178,68 +491,64 @@ mod tests {
             service: Some("reg".into()),
             scope: None,
         };
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
 
-        let token = fetch_token(
-            &state(false),
-            &challenge,
-            &UpstreamAuthKind::None,
-            "repository:x:pull",
-        )
-        .await
-        .unwrap();
+        let token = fetch_token(&state(), &target, &challenge).await.unwrap();
 
         assert_eq!(token, "anon-token");
         server.verify().await;
     }
 
     #[tokio::test]
-    async fn gcp_auth_sends_oauth2accesstoken_basic_and_accepts_access_token() {
-        let server = MockServer::start().await;
+    async fn builds_gcp_basic_auth_for_valid_https_same_origin_without_sending() {
+        let (state, calls) = counting_gcp_state();
         let expected =
             base64::engine::general_purpose::STANDARD.encode("oauth2accesstoken:fake-gcp-token");
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .and(query_param("scope", "repository:x:pull"))
-            .and(header(
-                "authorization",
-                format!("Basic {expected}").as_str(),
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "gcp-registry-token"
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let target = target("registry.example", UpstreamAuthKind::Gcp, false);
         let challenge = BearerChallenge {
-            realm: format!("{}/token", server.uri()),
-            service: None,
-            scope: Some("repository:x:pull".into()),
-        };
-
-        let token = fetch_token(&state(true), &challenge, &UpstreamAuthKind::Gcp, "unused")
-            .await
-            .unwrap();
-
-        assert_eq!(token, "gcp-registry-token");
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn gcp_auth_requires_an_initialized_provider() {
-        let challenge = BearerChallenge {
-            realm: "https://auth.example/token".into(),
+            realm: "https://REGISTRY.EXAMPLE:443/token".into(),
             service: None,
             scope: None,
         };
 
-        let error = fetch_token(
-            &state(false),
-            &challenge,
-            &UpstreamAuthKind::Gcp,
-            "repository:x:pull",
-        )
-        .await
-        .unwrap_err();
+        let request = build_token_request(&state, &target, &challenge)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().scheme(), "https");
+        assert_eq!(request.url().host_str(), Some("registry.example"));
+        assert_eq!(request.url().path(), "/token");
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            format!("Basic {expected}")
+        );
+        assert!(
+            request
+                .url()
+                .query_pairs()
+                .any(|(key, value)| key == "scope" && value == "repository:x:pull")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gcp_auth_requires_an_initialized_provider() {
+        let target = target("registry.example", UpstreamAuthKind::Gcp, false);
+        let challenge = BearerChallenge {
+            realm: "https://registry.example/token".into(),
+            service: None,
+            scope: None,
+        };
+
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, crate::error::AppError::Internal(_)));
     }
@@ -257,15 +566,15 @@ mod tests {
             service: None,
             scope: None,
         };
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
 
-        let error = fetch_token(
-            &state(false),
-            &challenge,
-            &UpstreamAuthKind::None,
-            "repository:x:pull",
-        )
-        .await
-        .unwrap_err();
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, crate::error::AppError::Upstream(_)));
     }
@@ -283,15 +592,15 @@ mod tests {
             service: None,
             scope: None,
         };
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
 
-        let error = fetch_token(
-            &state(false),
-            &challenge,
-            &UpstreamAuthKind::None,
-            "repository:x:pull",
-        )
-        .await
-        .unwrap_err();
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, crate::error::AppError::Upstream(_)));
     }
@@ -309,15 +618,15 @@ mod tests {
             service: None,
             scope: None,
         };
+        let target = target(
+            server.uri().trim_start_matches("http://"),
+            UpstreamAuthKind::None,
+            true,
+        );
 
-        let error = fetch_token(
-            &state(false),
-            &challenge,
-            &UpstreamAuthKind::None,
-            "repository:x:pull",
-        )
-        .await
-        .unwrap_err();
+        let error = fetch_token(&state(), &target, &challenge)
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, crate::error::AppError::Upstream(_)));
     }

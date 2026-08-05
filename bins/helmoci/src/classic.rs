@@ -370,6 +370,7 @@ mod tests {
     use crate::error::AppError;
     use crate::state::{
         AppState, PublicDnsResolver, SharedState, build_public_http, build_test_no_redirect_http,
+        build_token_http,
     };
     use helmoci_storage::EphemeralStorage;
     use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -397,6 +398,7 @@ mod tests {
         let rc = parse_config("storage:\n  type: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
         let index_cache = moka::future::Cache::builder().max_capacity(32).build();
+        let token_http = build_token_http().unwrap();
         let upstream_tokens = moka::future::Cache::builder()
             .max_capacity(256)
             .time_to_live(Duration::from_secs(240))
@@ -408,6 +410,7 @@ mod tests {
             ephemeral,
             http,
             public_http,
+            token_http,
             index_cache,
             gcp: None,
             upstream_tokens,
