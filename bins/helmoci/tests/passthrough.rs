@@ -305,6 +305,34 @@ async fn encoded_alias_escape_is_rejected_before_registry_or_adc_contact() {
 }
 
 #[tokio::test]
+async fn encoded_backslash_manifest_escape_is_rejected_before_registry_or_adc_contact() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = common::app_with_gcp(&gcp_cfg(&server), Arc::new(CountingGcp(calls.clone())));
+
+    let (status, _, body) = common::send(
+        &app,
+        "GET",
+        "/v2/meteora/app/manifests/..%5C..%5C..%5Cprivate%5Cmanifests%5Clatest",
+        "proxy.test",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["errors"][0]["code"],
+        "NAME_UNKNOWN"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn cached_manifest_respects_current_accept_representation() {
     const DOCKER_LIST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}"#;
     let server = MockServer::start().await;
@@ -358,16 +386,17 @@ async fn cached_manifest_respects_current_accept_representation() {
 }
 
 #[tokio::test]
-async fn absolute_tag_link_is_rewritten_to_proxy_relative_path() {
+async fn same_origin_absolute_tag_link_is_rewritten_to_proxy_relative_path() {
     let server = MockServer::start().await;
+    let link = format!(
+        "<{}/v2/up/charts/app/tags/list?n=1>; rel=next",
+        server.uri()
+    );
     Mock::given(method("GET"))
         .and(path("/v2/up/charts/app/tags/list"))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header(
-                    "link",
-                    "<https://registry.example/v2/up/charts/app/tags/list?n=1>; rel=next",
-                )
+                .insert_header("link", link.as_str())
                 .set_body_json(serde_json::json!({"name":"up/charts/app","tags":["1"]})),
         )
         .mount(&server)

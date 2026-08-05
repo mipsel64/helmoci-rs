@@ -1,5 +1,7 @@
 use percent_encoding::percent_decode_str;
 
+use super::Digest;
+
 #[derive(Debug, PartialEq)]
 pub enum OciRoute {
     Api,
@@ -7,6 +9,16 @@ pub enum OciRoute {
     Blob { name: String, digest: String },
     Tags { name: String },
     NotFound,
+}
+
+fn is_valid_manifest_reference(reference: &str) -> bool {
+    if Digest::parse(reference).is_some() {
+        return true;
+    }
+    let mut bytes = reference.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric() || byte == b'_')
+        && reference.len() <= 128
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
 }
 
 /// Parse OCI Distribution V2 paths, mirroring upstream helmoci's parseOciPath.
@@ -29,7 +41,7 @@ pub fn parse_oci_path(pathname: &str) -> OciRoute {
     if let Some(idx) = rest.rfind("/manifests/") {
         let name = &rest[..idx];
         let reference = &rest[idx + "/manifests/".len()..];
-        if name.is_empty() || reference.is_empty() || reference.contains('/') {
+        if name.is_empty() || !is_valid_manifest_reference(reference) {
             return OciRoute::NotFound;
         }
         return OciRoute::Manifest {
@@ -134,5 +146,38 @@ mod tests {
                 reference: "1.0".into()
             }
         );
+    }
+
+    #[test]
+    fn manifest_reference_requires_a_canonical_digest_or_safe_tag() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        for reference in ["1.0.0", "chart_v2", "A-tag.1", digest] {
+            assert!(matches!(
+                parse_oci_path(&format!("/v2/a.io/b/manifests/{reference}")),
+                OciRoute::Manifest { .. }
+            ));
+        }
+        for reference in [
+            ".",
+            "..",
+            "tag\\private",
+            "tag?query",
+            "tag#fragment",
+            "tag\u{1f}control",
+            &"a".repeat(129),
+        ] {
+            assert_eq!(
+                parse_oci_path(&format!("/v2/a.io/b/manifests/{reference}")),
+                OciRoute::NotFound,
+                "{reference:?}"
+            );
+        }
+        for encoded in ["tag%5Cprivate", "tag%3Fquery", "tag%23fragment"] {
+            assert_eq!(
+                parse_oci_path(&format!("/v2/a.io/b/manifests/{encoded}")),
+                OciRoute::NotFound,
+                "{encoded}"
+            );
+        }
     }
 }

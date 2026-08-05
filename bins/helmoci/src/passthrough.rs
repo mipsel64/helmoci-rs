@@ -207,9 +207,24 @@ pub async fn fetch_token(
         .ok_or_else(|| AppError::Upstream("token response had no token".into()))
 }
 
-fn upstream_base(target: &OciTarget) -> String {
+fn upstream_url(target: &OciTarget, suffix: &str) -> Result<url::Url, AppError> {
     let scheme = if target.plain_http { "http" } else { "https" };
-    format!("{scheme}://{}/v2/{}", target.registry, target.repo)
+    let mut url = url::Url::parse(&format!("{scheme}://{}/", target.registry))
+        .map_err(|_| AppError::Upstream("invalid OCI upstream target".into()))?;
+    let (path, query) = suffix.split_once('?').unwrap_or((suffix, ""));
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| AppError::Upstream("invalid OCI upstream target".into()))?;
+        segments.pop_if_empty();
+        segments.push("v2");
+        segments.extend(target.repo.split('/'));
+        segments.extend(path.split('/'));
+    }
+    if !query.is_empty() {
+        url.set_query(Some(query));
+    }
+    Ok(url)
 }
 
 fn upstream_token_cache_key(target: &OciTarget) -> String {
@@ -336,20 +351,33 @@ async fn read_upstream_body(
 fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
     let link = link.trim();
     let uri = link.strip_prefix('<')?.split_once('>')?;
-    let upstream_path = format!("/v2/{}/tags/list", target.repo);
-    let path_and_query = if uri.0.starts_with('/') {
-        uri.0.to_string()
-    } else {
-        let parsed = url::Url::parse(uri.0).ok()?;
-        match parsed.query() {
-            Some(query) => format!("{}?{query}", parsed.path()),
-            None => parsed.path().to_string(),
-        }
-    };
-    let suffix = path_and_query.strip_prefix(&upstream_path)?;
-    if !suffix.is_empty() && !suffix.starts_with('?') {
+    if (!uri.1.is_empty() && !uri.1.trim_start().starts_with(';'))
+        || uri.1.contains(',')
+        || uri.1.contains('<')
+    {
         return None;
     }
+    let upstream_path = format!("/v2/{}/tags/list", target.repo);
+    let query = if uri.0.starts_with('/') {
+        let (path, query) = uri.0.split_once('?').unwrap_or((uri.0, ""));
+        (path == upstream_path).then(|| query.to_string())?
+    } else {
+        let parsed = url::Url::parse(uri.0).ok()?;
+        let target_origin = url::Url::parse(&format!(
+            "{}://{}/",
+            if target.plain_http { "http" } else { "https" },
+            target.registry
+        ))
+        .ok()?
+        .origin();
+        (parsed.origin() == target_origin && parsed.path() == upstream_path)
+            .then(|| parsed.query().unwrap_or_default().to_string())?
+    };
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
     Some(format!(
         "</v2/{}/tags/list{}>{}",
         target.full_name, suffix, uri.1
@@ -390,10 +418,10 @@ pub async fn send_upstream(
         ));
     }
 
-    let url = format!("{}/{}", upstream_base(target), suffix);
+    let url = upstream_url(target, suffix)?;
     let cache_key = upstream_token_cache_key(target);
     let build = |token: Option<String>| {
-        let mut request = state.http.request(method.clone(), &url);
+        let mut request = state.http.request(method.clone(), url.clone());
         if let Some(accept) = accept {
             request = request.header(reqwest::header::ACCEPT, accept);
         }
@@ -767,6 +795,31 @@ mod tests {
             media_type
         ));
         assert!(!accepts_media_type(Some("*/*;q=0"), media_type));
+    }
+
+    #[test]
+    fn tag_links_require_the_target_origin_and_a_single_entry() {
+        let target = target("registry.example", UpstreamAuthKind::None, false);
+        let valid_path = "/v2/x/tags/list?n=one,two";
+        assert_eq!(
+            rewrite_tag_link(
+                &format!("<https://registry.example{valid_path}>; rel=next"),
+                &target
+            ),
+            Some("</v2/alias/x/tags/list?n=one,two>; rel=next".into())
+        );
+        assert_eq!(
+            rewrite_tag_link(&format!("<{valid_path}>; rel=next"), &target),
+            Some("</v2/alias/x/tags/list?n=one,two>; rel=next".into())
+        );
+        for link in [
+            "<http://registry.example/v2/x/tags/list?n=1>; rel=next",
+            "<https://registry.example:444/v2/x/tags/list?n=1>; rel=next",
+            "<https://foreign.example/v2/x/tags/list?n=1>; rel=next",
+            "<https://registry.example/v2/x/tags/list?n=1>; rel=next, <https://foreign.example/v2/x/tags/list?n=2>; rel=prev",
+        ] {
+            assert_eq!(rewrite_tag_link(link, &target), None, "{link}");
+        }
     }
 
     #[tokio::test]
