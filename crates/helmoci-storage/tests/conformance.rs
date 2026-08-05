@@ -1,11 +1,22 @@
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use helmoci_core::oci::{Digest, MEDIA_TYPE_MANIFEST, TagPointer};
 use helmoci_storage::{Blob, ObjectStoreStorage, Storage, TagScope, blob_key, tag_key};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::{ObjectStore, PutPayload};
-use std::sync::Arc;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+use tokio::sync::Notify;
 
 async fn collect(blob: Blob) -> Vec<u8> {
     blob.data
@@ -105,6 +116,135 @@ async fn corrupt_tag_pointer_is_a_cache_miss() {
         storage.get_tag_pointer(&scope, "broken").await.unwrap(),
         None
     );
+}
+
+#[derive(Debug)]
+struct InterleavingStore {
+    inner: InMemory,
+    heads: AtomicUsize,
+    second_head: Notify,
+    first_write: Notify,
+}
+
+impl fmt::Display for InterleavingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("interleaving-store")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for InterleavingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if !opts.attributes.is_empty() {
+            return Err(object_store::Error::NotImplemented);
+        }
+
+        let is_first = payload
+            .as_ref()
+            .iter()
+            .any(|chunk| chunk.as_ref() == b"first");
+        if is_first {
+            let result = self.inner.put_opts(location, payload, opts).await;
+            self.first_write.notify_one();
+            result
+        } else {
+            self.first_write.notified().await;
+            self.inner.put_opts(location, payload, opts).await
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn head(&self, location: &object_store::path::Path) -> object_store::Result<ObjectMeta> {
+        if self.heads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.second_head.notified().await;
+        } else {
+            self.second_head.notify_one();
+        }
+        self.inner.head(location).await
+    }
+
+    async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+#[tokio::test]
+async fn concurrent_creates_do_not_overwrite_the_first_blob() {
+    let storage = Arc::new(ObjectStoreStorage::new(Arc::new(InterleavingStore {
+        inner: InMemory::new(),
+        heads: AtomicUsize::new(0),
+        second_head: Notify::new(),
+        first_write: Notify::new(),
+    })));
+    let digest = Digest::sha256(b"first");
+
+    let (first, second) = tokio::join!(
+        storage.put_blob(
+            &digest,
+            "application/octet-stream",
+            Bytes::from_static(b"first")
+        ),
+        storage.put_blob(
+            &digest,
+            "application/octet-stream",
+            Bytes::from_static(b"second")
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+
+    let blob = storage.get_blob(&digest).await.unwrap().unwrap();
+    assert_eq!(collect(blob).await, b"first");
 }
 
 #[test]

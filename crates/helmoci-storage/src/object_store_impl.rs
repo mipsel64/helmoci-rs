@@ -4,7 +4,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use helmoci_core::oci::{Digest, TagPointer};
 use object_store::path::Path;
-use object_store::{Attribute, Attributes, ObjectStore, PutOptions};
+use object_store::{Attribute, Attributes, ObjectStore, PutMode, PutOptions};
 use std::sync::Arc;
 
 /// One implementation for every object_store backend: R2 (S3), GCS, local fs, memory.
@@ -66,25 +66,25 @@ impl Storage for ObjectStoreStorage {
         content_type: &str,
         data: Bytes,
     ) -> Result<(), StorageError> {
-        if self.head_blob(digest).await?.is_some() {
-            return Ok(());
-        }
-
         let path = Self::path(&blob_key(digest))?;
         let mut attributes = Attributes::new();
         attributes.insert(Attribute::ContentType, content_type.to_string().into());
         let opts = PutOptions {
+            mode: PutMode::Create,
             attributes,
             ..Default::default()
         };
         match self.store.put_opts(&path, data.clone().into(), opts).await {
-            Ok(_) => Ok(()),
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
             Err(object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented) => {
-                self.store
-                    .put(&path, data.into())
-                    .await
-                    .map_err(backend_err)?;
-                Ok(())
+                let opts = PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                };
+                match self.store.put_opts(&path, data.into(), opts).await {
+                    Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                    Err(e) => Err(backend_err(e)),
+                }
             }
             Err(e) => Err(backend_err(e)),
         }
