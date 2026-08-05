@@ -1,4 +1,5 @@
 pub mod digest;
+pub mod route;
 
 pub use digest::Digest;
 
