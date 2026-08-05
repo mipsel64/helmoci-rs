@@ -44,6 +44,10 @@ FROM alpine:3.22 AS certs
 RUN apk --update add ca-certificates
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+
+LABEL org.opencontainers.image.source="https://github.com/mipsel64/helmoci-rs"
+LABEL org.opencontainers.image.description="HelmOCI serves charts from classic Helm repositories and configured OCI upstream aliases behind one read-only OCI Distribution endpoint."
+
 WORKDIR /
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=nonroot:nonroot /helmoci /usr/local/bin/helmoci
