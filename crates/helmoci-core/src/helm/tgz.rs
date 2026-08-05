@@ -65,6 +65,17 @@ fn invalid(e: impl std::fmt::Display) -> HelmError {
     HelmError::InvalidChart(format!("invalid chart archive: {e}"))
 }
 
+fn unsupported_extension_name(entry_type: tar::EntryType) -> Option<&'static str> {
+    match entry_type {
+        tar::EntryType::GNULongName => Some("GNU long-name"),
+        tar::EntryType::GNULongLink => Some("GNU long-link"),
+        tar::EntryType::XHeader => Some("local PAX"),
+        tar::EntryType::XGlobalHeader => Some("global PAX"),
+        tar::EntryType::GNUSparse => Some("GNU sparse"),
+        _ => None,
+    }
+}
+
 /// Regular files only — matches upstream helmoci, which drops other entry types.
 pub(crate) fn unpack_tgz_with_limits(
     tgz: &[u8],
@@ -73,40 +84,57 @@ pub(crate) fn unpack_tgz_with_limits(
     let mut archive = tar::Archive::new(GzDecoder::new(tgz));
     let mut files = Vec::new();
     let mut expanded_bytes = 0_u64;
-    let mut file_count = 0_usize;
-    for entry in archive.entries().map_err(invalid)? {
+    let mut entry_count = 0_usize;
+    for entry in archive.entries().map_err(invalid)?.raw(true) {
         let mut entry = entry.map_err(invalid)?;
-        if entry.header().entry_type() != tar::EntryType::Regular {
-            continue;
-        }
+        let entry_type = entry.header().entry_type();
 
-        let next_file_count = file_count
+        let next_entry_count = entry_count
             .checked_add(1)
-            .ok_or_else(|| invalid("regular file count overflow"))?;
-        if next_file_count > limits.max_files {
+            .ok_or_else(|| invalid("archive entry count overflow"))?;
+        if next_entry_count > limits.max_files {
             return Err(invalid(format_args!(
-                "regular file count exceeds limit ({next_file_count} > {})",
+                "archive entry count exceeds limit ({next_entry_count} > {})",
                 limits.max_files
             )));
         }
 
-        let file_size = entry.size();
-        if file_size > limits.max_file_bytes {
+        let entry_size = entry.size();
+        if entry_size > limits.max_file_bytes {
+            if entry_type != tar::EntryType::Regular {
+                return Err(invalid(format_args!(
+                    "archive entry exceeds per-entry limit ({entry_size} > {} bytes)",
+                    limits.max_file_bytes
+                )));
+            }
             return Err(invalid(format_args!(
-                "regular file exceeds per-file limit ({file_size} > {} bytes)",
+                "regular file exceeds per-file limit ({entry_size} > {} bytes)",
                 limits.max_file_bytes
             )));
         }
         let next_expanded_bytes = expanded_bytes
-            .checked_add(file_size)
-            .ok_or_else(|| invalid("expanded regular file byte count overflow"))?;
+            .checked_add(entry_size)
+            .ok_or_else(|| invalid("expanded archive entry byte count overflow"))?;
         if next_expanded_bytes > limits.max_expanded_bytes {
             return Err(invalid(format_args!(
-                "expanded regular files exceed limit ({next_expanded_bytes} > {} bytes)",
+                "expanded archive entries exceed limit ({next_expanded_bytes} > {} bytes)",
                 limits.max_expanded_bytes
             )));
         }
-        let file_capacity = usize::try_from(file_size)
+
+        if let Some(name) = unsupported_extension_name(entry_type) {
+            return Err(invalid(format_args!(
+                "unsupported tar extension entry: {name}"
+            )));
+        }
+
+        entry_count = next_entry_count;
+        expanded_bytes = next_expanded_bytes;
+        if entry_type != tar::EntryType::Regular {
+            continue;
+        }
+
+        let file_capacity = usize::try_from(entry_size)
             .map_err(|_| invalid("regular file size cannot be represented on this platform"))?;
 
         files
@@ -125,9 +153,9 @@ pub(crate) fn unpack_tgz_with_limits(
         entry.read_to_end(&mut data).map_err(invalid)?;
         let actual_size = u64::try_from(data.len())
             .map_err(|_| invalid("regular file size cannot be represented as bytes"))?;
-        if actual_size != file_size {
+        if actual_size != entry_size {
             return Err(invalid(format_args!(
-                "regular file size differs from header ({actual_size} != {file_size} bytes)"
+                "regular file size differs from header ({actual_size} != {entry_size} bytes)"
             )));
         }
         files.push(TgzFile {
@@ -136,8 +164,6 @@ pub(crate) fn unpack_tgz_with_limits(
             mode,
             mtime,
         });
-        file_count = next_file_count;
-        expanded_bytes = next_expanded_bytes;
     }
     Ok(files)
 }
@@ -178,18 +204,68 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
 
-    fn header_only_tgz(name: &str, declared_size: u64) -> Vec<u8> {
-        let mut header = tar::Header::new_gnu();
-        header.set_path(name).unwrap();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(declared_size);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_cksum();
-
+    fn gzip(tar_bytes: &[u8]) -> Vec<u8> {
         let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        gz.write_all(header.as_bytes()).unwrap();
+        gz.write_all(tar_bytes).unwrap();
         gz.finish().unwrap()
+    }
+
+    fn raw_entries_tgz(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            for (name, entry_type, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(*entry_type);
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(0);
+                header.set_cksum();
+                builder.append_data(&mut header, name, *data).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        gzip(&tar_bytes)
+    }
+
+    fn header_only_entries_tgz(entries: &[(&str, tar::EntryType, u64)]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        for (name, entry_type, declared_size) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_entry_type(*entry_type);
+            header.set_size(*declared_size);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            tar_bytes.extend_from_slice(header.as_bytes());
+        }
+        gzip(&tar_bytes)
+    }
+
+    fn header_only_tgz(name: &str, declared_size: u64) -> Vec<u8> {
+        header_only_entries_tgz(&[(name, tar::EntryType::Regular, declared_size)])
+    }
+
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let body = format!("{key}={value}\n");
+        let mut digits = 1;
+        loop {
+            let length = digits + 1 + body.len();
+            let next_digits = length.to_string().len();
+            if digits == next_digits {
+                return format!("{length} {body}").into_bytes();
+            }
+            digits = next_digits;
+        }
+    }
+
+    fn extension_limits() -> ArchiveLimits {
+        ArchiveLimits {
+            max_expanded_bytes: 32,
+            max_file_bytes: 32,
+            max_files: 4,
+        }
     }
 
     fn invalid_chart_message(result: Result<Vec<TgzFile>, HelmError>) -> String {
@@ -230,12 +306,12 @@ mod tests {
 
         assert_eq!(
             message,
-            "invalid chart archive: expanded regular files exceed limit (6 > 5 bytes)"
+            "invalid chart archive: expanded archive entries exceed limit (6 > 5 bytes)"
         );
     }
 
     #[test]
-    fn rejects_archives_that_exceed_the_regular_file_count_limit() {
+    fn rejects_archives_that_exceed_the_entry_count_limit() {
         let tgz = testutil::build_chart_tgz(&[("demo/a", "a"), ("demo/b", "b")]);
         let limits = ArchiveLimits {
             max_expanded_bytes: 2,
@@ -247,7 +323,121 @@ mod tests {
 
         assert_eq!(
             message,
-            "invalid chart archive: regular file count exceeds limit (2 > 1)"
+            "invalid chart archive: archive entry count exceeds limit (2 > 1)"
         );
+    }
+
+    #[test]
+    fn rejects_oversized_highly_compressible_gnu_long_name_metadata() {
+        let mut metadata = vec![b'a'; 4096];
+        metadata.push(0);
+        let tgz = raw_entries_tgz(&[
+            ("././@LongLink", tar::EntryType::GNULongName, &metadata),
+            ("placeholder", tar::EntryType::Regular, b"x"),
+        ]);
+        assert!(tgz.len() < metadata.len() / 4);
+
+        let message = invalid_chart_message(unpack_tgz_with_limits(&tgz, extension_limits()));
+
+        assert_eq!(
+            message,
+            "invalid chart archive: archive entry exceeds per-entry limit (4097 > 32 bytes)"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_highly_compressible_local_pax_metadata() {
+        let metadata = pax_record("path", &"a".repeat(4096));
+        let tgz = raw_entries_tgz(&[
+            ("PaxHeader", tar::EntryType::XHeader, &metadata),
+            ("placeholder", tar::EntryType::Regular, b"x"),
+        ]);
+        assert!(tgz.len() < metadata.len() / 4);
+
+        let message = invalid_chart_message(unpack_tgz_with_limits(&tgz, extension_limits()));
+
+        assert_eq!(
+            message,
+            "invalid chart archive: archive entry exceeds per-entry limit (4107 > 32 bytes)"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_extensions_from_headers_before_reading_payload() {
+        let limits = ArchiveLimits {
+            max_expanded_bytes: 1,
+            max_file_bytes: 1,
+            max_files: 1,
+        };
+        let cases = [
+            (tar::EntryType::GNULongName, "GNU long-name"),
+            (tar::EntryType::GNULongLink, "GNU long-link"),
+            (tar::EntryType::XHeader, "local PAX"),
+            (tar::EntryType::XGlobalHeader, "global PAX"),
+            (tar::EntryType::GNUSparse, "GNU sparse"),
+        ];
+
+        for (entry_type, label) in cases {
+            let tgz = header_only_entries_tgz(&[("extension", entry_type, 1)]);
+            let message = invalid_chart_message(unpack_tgz_with_limits(&tgz, limits));
+
+            assert_eq!(
+                message,
+                format!("invalid chart archive: unsupported tar extension entry: {label}")
+            );
+        }
+    }
+
+    #[test]
+    fn counts_non_regular_and_sparse_entries_before_rejecting_extensions() {
+        let tgz = header_only_entries_tgz(&[
+            ("directory", tar::EntryType::Directory, 0),
+            ("sparse", tar::EntryType::GNUSparse, 1),
+        ]);
+        let limits = ArchiveLimits {
+            max_expanded_bytes: 1,
+            max_file_bytes: 1,
+            max_files: 1,
+        };
+
+        let message = invalid_chart_message(unpack_tgz_with_limits(&tgz, limits));
+
+        assert_eq!(
+            message,
+            "invalid chart archive: archive entry count exceeds limit (2 > 1)"
+        );
+    }
+
+    #[test]
+    fn charges_skipped_entry_payloads_to_the_cumulative_limit() {
+        let tgz = raw_entries_tgz(&[
+            ("directory", tar::EntryType::Directory, b"abc"),
+            ("symlink", tar::EntryType::Symlink, b"def"),
+        ]);
+        let limits = ArchiveLimits {
+            max_expanded_bytes: 5,
+            max_file_bytes: 3,
+            max_files: 2,
+        };
+
+        let message = invalid_chart_message(unpack_tgz_with_limits(&tgz, limits));
+
+        assert_eq!(
+            message,
+            "invalid chart archive: expanded archive entries exceed limit (6 > 5 bytes)"
+        );
+    }
+
+    #[test]
+    fn accepts_ustar_prefix_paths_without_extension_headers() {
+        let directory = "a".repeat(120);
+        let path = format!("{directory}/Chart.yaml");
+        let tgz = testutil::build_chart_tgz(&[(&path, "ok")]);
+
+        let files = unpack_tgz_with_limits(&tgz, ArchiveLimits::for_chart_bytes(1024)).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, path);
+        assert_eq!(files[0].data, b"ok");
     }
 }
