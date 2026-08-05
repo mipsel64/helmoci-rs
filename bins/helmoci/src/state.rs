@@ -15,7 +15,7 @@ pub struct AppState {
     pub token_http: reqwest::Client,
     pub index_cache: moka::future::Cache<String, Arc<String>>,
     pub gcp: Option<Arc<dyn crate::gcp::GcpTokenProvider>>,
-    /// Bearer tokens for upstream registries, keyed by registry|repo.
+    /// Tokens keyed by scheme, auth mode, registry, and repository.
     pub upstream_tokens: moka::future::Cache<String, String>,
 }
 
