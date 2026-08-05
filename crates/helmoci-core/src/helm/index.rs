@@ -60,10 +60,10 @@ pub fn list_versions(
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for entry in entries {
-        if let Some(v) = entry.version {
-            if seen.insert(v.clone()) {
-                out.push(v);
-            }
+        if let Some(v) = entry.version
+            && seen.insert(v.clone())
+        {
+            out.push(v);
         }
     }
     Ok(out)

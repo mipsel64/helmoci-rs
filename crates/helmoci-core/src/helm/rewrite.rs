@@ -102,10 +102,8 @@ pub fn rewrite_chart_dependencies(
                 Some(map) => rewrite_deps_list(map.get_mut(&dep_key), ctx, None),
                 None => false,
             };
-            if lock_modified {
-                if let Ok(text) = serde_yaml_ng::to_string(&lock_value) {
-                    files[lock_idx].data = text.into_bytes();
-                }
+            if lock_modified && let Ok(text) = serde_yaml_ng::to_string(&lock_value) {
+                files[lock_idx].data = text.into_bytes();
             }
         }
     }
