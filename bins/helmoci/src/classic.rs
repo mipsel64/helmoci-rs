@@ -7,22 +7,51 @@ use futures::StreamExt;
 use helmoci_core::helm::rewrite::RewriteContext;
 use helmoci_core::oci::build::{BuiltChart, build_helm_oci_chart};
 use helmoci_core::oci::{
-    Digest, MEDIA_TYPE_HELM_CHART, MEDIA_TYPE_HELM_CONFIG, MEDIA_TYPE_MANIFEST,
+    Digest, MEDIA_TYPE_HELM_CHART, MEDIA_TYPE_HELM_CONFIG, MEDIA_TYPE_MANIFEST, OciManifest,
 };
-use helmoci_core::resolver::ClassicChart;
+use helmoci_core::resolver::{ClassicChart, ClassicSource, is_public_hostname};
 use helmoci_storage::{Blob, Storage, TagScope};
 use std::sync::Arc;
 
 /// index.yaml text for a repo, via the in-process TTL cache.
-pub async fn fetch_index_text(state: &AppState, repo_url: &str) -> Result<Arc<String>, AppError> {
+fn http_client<'a>(
+    state: &'a AppState,
+    url: &str,
+    source: ClassicSource,
+) -> Result<&'a reqwest::Client, AppError> {
+    if source == ClassicSource::ConfiguredAlias {
+        return Ok(&state.http);
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|error| AppError::Upstream(format!("invalid automatic upstream URL: {error}")))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.host_str().is_some_and(is_public_hostname)
+    {
+        return Err(AppError::Upstream(format!(
+            "automatic upstream URL is not a public http(s) hostname: {url}"
+        )));
+    }
+    Ok(&state.public_http)
+}
+
+pub async fn fetch_index_text(
+    state: &AppState,
+    repo_url: &str,
+    source: ClassicSource,
+) -> Result<Arc<String>, AppError> {
     let index_url = format!("{}/index.yaml", repo_url.trim_end_matches('/'));
-    if let Some(text) = state.index_cache.get(&index_url).await {
+    let cache_prefix = match source {
+        ClassicSource::ConfiguredAlias => "configured",
+        ClassicSource::HostPath => "host-path",
+    };
+    let cache_key = format!("{cache_prefix}:{index_url}");
+    let http = http_client(state, &index_url, source)?;
+    if let Some(text) = state.index_cache.get(&cache_key).await {
         tracing::debug!(url = %index_url, "index cache hit");
         return Ok(text);
     }
 
-    let resp = state
-        .http
+    let resp = http
         .get(&index_url)
         .header(
             reqwest::header::ACCEPT,
@@ -49,16 +78,24 @@ pub async fn fetch_index_text(state: &AppState, repo_url: &str) -> Result<Arc<St
             .await
             .map_err(|e| AppError::Upstream(e.to_string()))?,
     );
-    state.index_cache.insert(index_url, text.clone()).await;
+    state.index_cache.insert(cache_key, text.clone()).await;
     Ok(text)
 }
 
 /// Download a chart tgz, enforcing max_chart_bytes while streaming.
-pub async fn download_chart(state: &AppState, chart_url: &str) -> Result<Vec<u8>, AppError> {
+pub async fn download_chart(
+    state: &AppState,
+    chart_url: &str,
+    source: ClassicSource,
+) -> Result<Vec<u8>, AppError> {
     let max = state.cfg.settings.max_chart_bytes;
-    let resp = state.http.get(chart_url).send().await.map_err(|e| {
-        AppError::Upstream(format!("failed to download chart from {chart_url}: {e}"))
-    })?;
+    let resp = http_client(state, chart_url, source)?
+        .get(chart_url)
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::Upstream(format!("failed to download chart from {chart_url}: {e}"))
+        })?;
 
     if !resp.status().is_success() {
         return Err(AppError::Upstream(format!(
@@ -106,6 +143,53 @@ pub async fn find_blob(state: &AppState, digest: &Digest) -> Result<Option<Blob>
     Ok(state.ephemeral.get_blob(digest).await?)
 }
 
+fn valid_helm_manifest(bytes: &[u8]) -> bool {
+    let Ok(manifest) = serde_json::from_slice::<OciManifest>(bytes) else {
+        return false;
+    };
+    manifest.schema_version == 2
+        && manifest.media_type == MEDIA_TYPE_MANIFEST
+        && manifest.config.media_type == MEDIA_TYPE_HELM_CONFIG
+        && !manifest.layers.is_empty()
+        && manifest
+            .layers
+            .iter()
+            .all(|layer| layer.media_type == MEDIA_TYPE_HELM_CHART)
+}
+
+async fn digest_manifest_response(
+    digest: &Digest,
+    blob: Blob,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    match blob.meta.content_type.as_deref() {
+        Some(MEDIA_TYPE_MANIFEST) => {
+            Ok(blob_response(MEDIA_TYPE_MANIFEST, digest, blob, head_only))
+        }
+        Some(_) => Err(AppError::ManifestUnknown(format!(
+            "manifest unknown: {digest}"
+        ))),
+        None => {
+            let mut bytes = Vec::with_capacity(blob.meta.size as usize);
+            let mut data = blob.data;
+            while let Some(chunk) = data.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            if !valid_helm_manifest(&bytes) {
+                return Err(AppError::ManifestUnknown(format!(
+                    "manifest unknown: {digest}"
+                )));
+            }
+            Ok(bytes_response(
+                MEDIA_TYPE_MANIFEST,
+                digest,
+                bytes,
+                head_only,
+            ))
+        }
+    }
+}
+
 pub async fn manifest(
     state: &AppState,
     proxy_host: &str,
@@ -115,8 +199,7 @@ pub async fn manifest(
 ) -> Result<Response, AppError> {
     if let Some(digest) = Digest::parse(reference) {
         return match find_blob(state, &digest).await? {
-            // this registry only ever stores helm image manifests
-            Some(blob) => Ok(blob_response(MEDIA_TYPE_MANIFEST, &digest, blob, head_only)),
+            Some(blob) => digest_manifest_response(&digest, blob, head_only).await,
             None => Err(AppError::ManifestUnknown(format!(
                 "manifest unknown: {digest}"
             ))),
@@ -135,7 +218,7 @@ pub async fn manifest(
         return Ok(blob_response(&ptr.media_type, &ptr.digest, blob, head_only));
     }
 
-    let index = fetch_index_text(state, &chart.repo_url).await?;
+    let index = fetch_index_text(state, &chart.repo_url, chart.source).await?;
     let chart_url = helmoci_core::helm::index::resolve_chart_url(
         &index,
         &chart.repo_url,
@@ -144,7 +227,7 @@ pub async fn manifest(
     )
     .map_err(AppError::from_helm_for_manifest)?;
     tracing::info!(url = %chart_url, repo = %chart.repo_url, "manifest cache miss, fetching");
-    let tgz = download_chart(state, &chart_url).await?;
+    let tgz = download_chart(state, &chart_url, chart.source).await?;
 
     let ctx = RewriteContext {
         proxy_host: proxy_host.to_string(),
@@ -222,7 +305,13 @@ mod tests {
     use super::*;
     use crate::config::{build_storage, parse_config};
     use crate::error::AppError;
-    use crate::state::{AppState, SharedState};
+    use crate::state::{
+        AppState, PublicDnsResolver, SharedState, build_public_http, build_test_no_redirect_http,
+    };
+    use helmoci_storage::EphemeralStorage;
+    use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::net::SocketAddr;
+    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -230,6 +319,34 @@ mod tests {
         let rc = parse_config("storage:\n  backend: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
         AppState::new(rc, storage).unwrap()
+    }
+
+    struct StaticResolver(Vec<SocketAddr>);
+
+    impl Resolve for StaticResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let addresses = self.0.clone();
+            Box::pin(async move { Ok(Box::new(addresses.into_iter()) as Addrs) })
+        }
+    }
+
+    fn state_with_clients(http: reqwest::Client, public_http: reqwest::Client) -> SharedState {
+        let rc = parse_config("storage:\n  backend: memory\nmax_chart_bytes: 1024\n").unwrap();
+        let storage = build_storage(&rc.settings.storage).unwrap();
+        let index_cache = moka::future::Cache::builder().max_capacity(32).build();
+        let ephemeral = Arc::new(EphemeralStorage::new(1024, Duration::from_secs(60)));
+        Arc::new(AppState {
+            cfg: rc,
+            storage,
+            ephemeral,
+            http,
+            public_http,
+            index_cache,
+        })
+    }
+
+    fn state_with_public_http(public_http: reqwest::Client) -> SharedState {
+        state_with_clients(reqwest::Client::new(), public_http)
     }
 
     #[tokio::test]
@@ -243,8 +360,12 @@ mod tests {
             .await;
 
         let state = state();
-        let a = fetch_index_text(&state, &server.uri()).await.unwrap();
-        let b = fetch_index_text(&state, &server.uri()).await.unwrap();
+        let a = fetch_index_text(&state, &server.uri(), ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap();
+        let b = fetch_index_text(&state, &server.uri(), ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap();
 
         assert_eq!(*a, "entries: {}\n");
         assert_eq!(*b, "entries: {}\n");
@@ -260,7 +381,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = fetch_index_text(&state(), &server.uri()).await.unwrap_err();
+        let err = fetch_index_text(&state(), &server.uri(), ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, AppError::Upstream(_)));
     }
@@ -279,7 +402,9 @@ mod tests {
             .await;
 
         let url = format!("{}/advertised-big.tgz", server.uri());
-        let err = download_chart(&state(), &url).await.unwrap_err();
+        let err = download_chart(&state(), &url, ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap_err();
 
         match err {
             AppError::TooLarge(message) => {
@@ -308,7 +433,9 @@ mod tests {
         let response = state.http.get(&url).send().await.unwrap();
         assert_eq!(response.content_length(), None);
         drop(response);
-        let err = download_chart(&state, &url).await.unwrap_err();
+        let err = download_chart(&state, &url, ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, AppError::TooLarge(_)));
         server.verify().await;
@@ -324,8 +451,105 @@ mod tests {
             .await;
 
         let url = format!("{}/ok.tgz", server.uri());
-        let bytes = download_chart(&state(), &url).await.unwrap();
+        let bytes = download_chart(&state(), &url, ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap();
 
         assert_eq!(bytes, b"tgz-bytes");
+    }
+
+    #[tokio::test]
+    async fn automatic_fetch_rejects_private_dns_without_contact() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("entries: {}\n"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let address = server.address();
+        let http =
+            build_public_http(PublicDnsResolver::new(StaticResolver(vec![*address]))).unwrap();
+        let url = format!("http://public.example:{}", address.port());
+
+        let result =
+            fetch_index_text(&state_with_public_http(http), &url, ClassicSource::HostPath).await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_fetch_does_not_follow_private_redirect() {
+        let private = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private-index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("entries: {}\n"))
+            .expect(0)
+            .mount(&private)
+            .await;
+        let public = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/private-index.yaml", private.uri())),
+            )
+            .mount(&public)
+            .await;
+        let address = public.address();
+        let http = build_test_no_redirect_http(StaticResolver(vec![*address])).unwrap();
+        let url = format!("http://public.example:{}", address.port());
+
+        let result =
+            fetch_index_text(&state_with_public_http(http), &url, ClassicSource::HostPath).await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+        private.verify().await;
+    }
+
+    #[tokio::test]
+    async fn trusted_index_cache_does_not_bypass_automatic_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("entries: {}\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let address = server.address();
+        let trusted_http = reqwest::Client::builder()
+            .resolve("public.example", *address)
+            .build()
+            .unwrap();
+        let public_http =
+            build_public_http(PublicDnsResolver::new(StaticResolver(vec![*address]))).unwrap();
+        let state = state_with_clients(trusted_http, public_http);
+        let url = format!("http://public.example:{}", address.port());
+
+        fetch_index_text(&state, &url, ClassicSource::ConfiguredAlias)
+            .await
+            .unwrap();
+        let result = fetch_index_text(&state, &url, ClassicSource::HostPath).await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_download_rejects_absolute_private_url_without_contact() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chart.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not-contacted"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let url = format!("{}/chart.tgz", server.uri());
+
+        let result = download_chart(&state(), &url, ClassicSource::HostPath).await;
+
+        assert!(matches!(result, Err(AppError::Upstream(_))));
+        server.verify().await;
     }
 }

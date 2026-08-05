@@ -188,3 +188,67 @@ async fn missing_blob_is_blob_unknown() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["errors"][0]["code"], "BLOB_UNKNOWN");
 }
+
+#[tokio::test]
+async fn config_and_layer_digests_are_not_manifests() {
+    let server = MockServer::start().await;
+    mount_upstream(&server, 1, 1).await;
+    let app = common::app(&cfg(&server.uri()));
+
+    let (status, _, body) =
+        common::send(&app, "GET", "/v2/test/demo/manifests/1.0.0", "proxy.test").await;
+    assert_eq!(status, StatusCode::OK);
+    let manifest: OciManifest = serde_json::from_slice(&body).unwrap();
+
+    for digest in [&manifest.config.digest, &manifest.layers[0].digest] {
+        let path = format!("/v2/test/demo/manifests/{digest}");
+        let (status, _, body) = common::send(&app, "GET", &path, "proxy.test").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["errors"][0]["code"], "MANIFEST_UNKNOWN");
+    }
+}
+
+#[tokio::test]
+async fn metadata_less_local_storage_validates_digest_manifests() {
+    let server = MockServer::start().await;
+    mount_upstream(&server, 1, 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = format!(
+        concat!(
+            "storage:\n  backend: local\n  local:\n    path: {path}\n",
+            "max_chart_bytes: 65536\n",
+            "aliases:\n  test:\n    upstream: {uri}\n    store: true\n",
+        ),
+        path = dir.path().display(),
+        uri = server.uri(),
+    );
+    let (app, state) = common::app_with_state(&cfg);
+
+    let (status, headers, body) =
+        common::send(&app, "GET", "/v2/test/demo/manifests/1.0.0", "proxy.test").await;
+    assert_eq!(status, StatusCode::OK);
+    let manifest_digest = headers["Docker-Content-Digest"].to_str().unwrap();
+    let manifest: OciManifest = serde_json::from_slice(&body).unwrap();
+    let stored = state
+        .storage
+        .get_blob(&helmoci_core::oci::Digest::parse(manifest_digest).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.meta.content_type.is_none());
+
+    let manifest_path = format!("/v2/test/demo/manifests/{manifest_digest}");
+    let (status, _, body) = common::send(&app, "GET", &manifest_path, "proxy.test").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<OciManifest>(&body).unwrap(),
+        manifest
+    );
+
+    let config_path = format!("/v2/test/demo/manifests/{}", manifest.config.digest);
+    let (status, _, body) = common::send(&app, "GET", &config_path, "proxy.test").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["errors"][0]["code"], "MANIFEST_UNKNOWN");
+}

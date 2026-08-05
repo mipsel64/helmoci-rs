@@ -30,6 +30,12 @@ pub struct Alias {
     pub plain_http: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassicSource {
+    ConfiguredAlias,
+    HostPath,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassicChart {
     pub repo_url: String,
@@ -37,6 +43,7 @@ pub struct ClassicChart {
     pub full_name: String,
     /// true when the chart comes from a `store: false` classic alias.
     pub ephemeral: bool,
+    pub source: ClassicSource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +149,7 @@ pub fn resolve_name(name: &str, aliases: &HashMap<String, Alias>) -> Option<Reso
                     chart_name: segments[1].to_string(),
                     full_name: name.to_string(),
                     ephemeral: !alias.store,
+                    source: ClassicSource::ConfiguredAlias,
                 }))
             }
             AliasUpstream::Oci { registry, repo } => {
@@ -189,6 +197,7 @@ fn resolve_host_path(segments: &[&str], name: &str) -> Option<Resolved> {
         chart_name: chart_name.to_string(),
         full_name: name.to_string(),
         ephemeral: false,
+        source: ClassicSource::HostPath,
     }))
 }
 
@@ -249,6 +258,7 @@ mod tests {
                 chart_name: "argo-cd".into(),
                 full_name: "argoproj.github.io/argo-helm/argo-cd".into(),
                 ephemeral: false,
+                source: ClassicSource::HostPath,
             })
         );
         let r = resolve_name("charts.jetstack.io/cert-manager", &HashMap::new()).unwrap();
@@ -259,6 +269,7 @@ mod tests {
                 chart_name: "cert-manager".into(),
                 full_name: "charts.jetstack.io/cert-manager".into(),
                 ephemeral: false,
+                source: ClassicSource::HostPath,
             })
         );
     }
@@ -285,6 +296,7 @@ mod tests {
                 chart_name: "argo-cd".into(),
                 full_name: "argo/argo-cd".into(),
                 ephemeral: false,
+                source: ClassicSource::ConfiguredAlias,
             })
         );
         assert!(resolve_name("argo/a/b", &aliases()).is_none());
