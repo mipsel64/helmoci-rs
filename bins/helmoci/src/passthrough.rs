@@ -348,13 +348,104 @@ async fn read_upstream_body(
     .await
 }
 
+fn is_link_token(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn consume_link_ows(bytes: &[u8], position: &mut usize) {
+    while matches!(bytes.get(*position), Some(b' ' | b'\t')) {
+        *position += 1;
+    }
+}
+
+fn valid_link_params(params: &str) -> bool {
+    let bytes = params.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() {
+        consume_link_ows(bytes, &mut position);
+        if bytes.get(position) != Some(&b';') {
+            return false;
+        }
+        position += 1;
+        consume_link_ows(bytes, &mut position);
+
+        let name_start = position;
+        while bytes.get(position).is_some_and(|byte| is_link_token(*byte)) {
+            position += 1;
+        }
+        if position == name_start {
+            return false;
+        }
+        consume_link_ows(bytes, &mut position);
+        if bytes.get(position) != Some(&b'=') {
+            continue;
+        }
+        position += 1;
+        consume_link_ows(bytes, &mut position);
+
+        if bytes.get(position) == Some(&b'"') {
+            position += 1;
+            loop {
+                let Some(byte) = bytes.get(position) else {
+                    return false;
+                };
+                position += 1;
+                match byte {
+                    b'"' => break,
+                    b'\\' => {
+                        let Some(escaped) = bytes.get(position) else {
+                            return false;
+                        };
+                        if *escaped < b' ' || *escaped == 0x7f {
+                            return false;
+                        }
+                        position += 1;
+                    }
+                    byte if *byte < b' ' || *byte == 0x7f => return false,
+                    _ => {}
+                }
+            }
+        } else {
+            let value_start = position;
+            while bytes.get(position).is_some_and(|byte| is_link_token(*byte)) {
+                position += 1;
+            }
+            if position == value_start {
+                return false;
+            }
+        }
+        consume_link_ows(bytes, &mut position);
+    }
+    true
+}
+
 fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
-    let link = link.trim();
-    let uri = link.strip_prefix('<')?.split_once('>')?;
-    if (!uri.1.is_empty() && !uri.1.trim_start().starts_with(';'))
-        || uri.1.contains(',')
-        || uri.1.contains('<')
+    let link = link.trim_matches([' ', '\t']);
+    if link
+        .bytes()
+        .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
     {
+        return None;
+    }
+    let uri = link.strip_prefix('<')?.split_once('>')?;
+    if !uri.1.is_empty() && !valid_link_params(uri.1) {
         return None;
     }
     let upstream_path = format!("/v2/{}/tags/list", target.repo);
@@ -382,6 +473,15 @@ fn rewrite_tag_link(link: &str, target: &OciTarget) -> Option<String> {
         "</v2/{}/tags/list{}>{}",
         target.full_name, suffix, uri.1
     ))
+}
+
+fn rewrite_upstream_tag_link(response: &reqwest::Response, target: &OciTarget) -> Option<String> {
+    let mut values = response.headers().get_all(header::LINK).iter();
+    let link = values.next()?.to_str().ok()?;
+    values
+        .next()
+        .is_none()
+        .then(|| rewrite_tag_link(link, target))?
 }
 
 async fn cached_manifest_response(
@@ -695,7 +795,7 @@ pub async fn tags(
             response.status().as_u16()
         )));
     }
-    let link = header_str(&response, "link").and_then(|link| rewrite_tag_link(&link, &target));
+    let link = rewrite_upstream_tag_link(&response, &target);
     let bytes =
         read_upstream_body(response, state.cfg.settings.max_chart_bytes, "tag list").await?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -812,6 +912,19 @@ mod tests {
             rewrite_tag_link(&format!("<{valid_path}>; rel=next"), &target),
             Some("</v2/alias/x/tags/list?n=one,two>; rel=next".into())
         );
+        assert_eq!(
+            rewrite_tag_link(
+                &format!("<{valid_path}>; rel=next; title=\"next, \\\"page\\\"\""),
+                &target
+            ),
+            Some(
+                "</v2/alias/x/tags/list?n=one,two>; rel=next; title=\"next, \\\"page\\\"\"".into()
+            )
+        );
+        assert_eq!(
+            rewrite_tag_link(&format!("<{valid_path}>; rel=next; extension"), &target),
+            Some("</v2/alias/x/tags/list?n=one,two>; rel=next; extension".into())
+        );
         for link in [
             "<http://registry.example/v2/x/tags/list?n=1>; rel=next",
             "<https://registry.example:444/v2/x/tags/list?n=1>; rel=next",
@@ -819,6 +932,23 @@ mod tests {
             "<https://registry.example/v2/x/tags/list?n=1>; rel=next, <https://foreign.example/v2/x/tags/list?n=2>; rel=prev",
         ] {
             assert_eq!(rewrite_tag_link(link, &target), None, "{link}");
+        }
+    }
+
+    #[test]
+    fn tag_links_reject_malformed_parameter_suffixes() {
+        let target = target("registry.example", UpstreamAuthKind::None, false);
+        let path = "/v2/x/tags/list?n=one,two";
+        for link in [
+            format!("<{path}>;"),
+            format!("<{path}>; =next"),
+            format!("<{path}>; rel="),
+            format!("<{path}>; title=\"unterminated"),
+            format!("<{path}>; rel=next, bogus"),
+            format!("<{path}>; rel=next, <{path}>; rel=prev"),
+            format!("<{path}>; title=\"has\u{7}control\""),
+        ] {
+            assert_eq!(rewrite_tag_link(&link, &target), None, "{link}");
         }
     }
 

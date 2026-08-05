@@ -410,6 +410,30 @@ async fn same_origin_absolute_tag_link_is_rewritten_to_proxy_relative_path() {
 }
 
 #[tokio::test]
+async fn repeated_upstream_tag_link_fields_are_omitted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v2/up/charts/app/tags/list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("link", "</v2/up/charts/app/tags/list?n=1>; rel=next")
+                .append_header(
+                    "link",
+                    "<https://foreign.example/v2/up/charts/app/tags/list?n=2>; rel=next",
+                )
+                .set_body_json(serde_json::json!({"name":"up/charts/app","tags":["1"]})),
+        )
+        .mount(&server)
+        .await;
+    let app = common::app(&cfg(&server, false));
+
+    let (status, headers, _) =
+        common::send(&app, "GET", "/v2/meteora/app/tags/list", "proxy.test").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("link").is_none());
+}
+
+#[tokio::test]
 async fn default_accept_supports_docker_manifest_lists() {
     const DOCKER_LIST: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}"#;
     let server = MockServer::start().await;
