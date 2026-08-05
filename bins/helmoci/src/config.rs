@@ -8,6 +8,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+const MAX_CACHE_TTL_SECS: u64 = 1_000 * 365 * 24 * 60 * 60;
+
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
@@ -157,6 +159,12 @@ pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
 }
 
 fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
+    if settings.index_cache_ttl_secs > MAX_CACHE_TTL_SECS {
+        bail!("index_cache_ttl_secs must not exceed {MAX_CACHE_TTL_SECS} seconds (1000 years)");
+    }
+    if settings.ephemeral_cache.ttl_secs > MAX_CACHE_TTL_SECS {
+        bail!("ephemeral_cache.ttl_secs must not exceed {MAX_CACHE_TTL_SECS} seconds (1000 years)");
+    }
     if settings.auth.enabled && !settings.auth.tokens.iter().any(|token| !token.is_empty()) {
         bail!("auth.enabled is true but auth.tokens has no non-empty token");
     }
@@ -323,6 +331,49 @@ mod tests {
         assert_eq!(rc.settings.index_cache_ttl_secs, 600);
         assert!(!rc.settings.auth.enabled);
         assert!(rc.aliases.is_empty());
+    }
+
+    #[test]
+    fn accepts_moka_ttl_boundary_for_both_caches() {
+        let rc = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "index_cache_ttl_secs: 31536000000\n",
+            "ephemeral_cache:\n  ttl_secs: 31536000000\n",
+        ))
+        .unwrap();
+
+        assert_eq!(rc.settings.index_cache_ttl_secs, 31_536_000_000);
+        assert_eq!(rc.settings.ephemeral_cache.ttl_secs, 31_536_000_000);
+    }
+
+    #[test]
+    fn rejects_index_cache_ttl_one_second_over_moka_limit() {
+        let error = match parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "index_cache_ttl_secs: 31536000001\n",
+        )) {
+            Ok(_) => panic!("expected oversized index cache TTL to be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("index_cache_ttl_secs"), "{message}");
+        assert!(message.contains("31536000000"), "{message}");
+    }
+
+    #[test]
+    fn rejects_ephemeral_cache_ttl_one_second_over_moka_limit() {
+        let error = match parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "ephemeral_cache:\n  ttl_secs: 31536000001\n",
+        )) {
+            Ok(_) => panic!("expected oversized ephemeral cache TTL to be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("ephemeral_cache.ttl_secs"), "{message}");
+        assert!(message.contains("31536000000"), "{message}");
     }
 
     #[test]

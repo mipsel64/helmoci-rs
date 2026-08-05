@@ -69,6 +69,10 @@ impl Storage for ObjectStoreStorage {
         let path = Self::path(&blob_key(digest))?;
         let mut attributes = Attributes::new();
         attributes.insert(Attribute::ContentType, content_type.to_string().into());
+        attributes.insert(
+            Attribute::Metadata("docker-content-digest".into()),
+            digest.to_string().into(),
+        );
         let opts = PutOptions {
             mode: PutMode::Create,
             attributes,
@@ -77,12 +81,28 @@ impl Storage for ObjectStoreStorage {
         match self.store.put_opts(&path, data.clone().into(), opts).await {
             Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
             Err(object_store::Error::NotSupported { .. } | object_store::Error::NotImplemented) => {
+                let mut attributes = Attributes::new();
+                attributes.insert(Attribute::ContentType, content_type.to_string().into());
                 let opts = PutOptions {
                     mode: PutMode::Create,
+                    attributes,
                     ..Default::default()
                 };
-                match self.store.put_opts(&path, data.into(), opts).await {
+                match self.store.put_opts(&path, data.clone().into(), opts).await {
                     Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                    Err(
+                        object_store::Error::NotSupported { .. }
+                        | object_store::Error::NotImplemented,
+                    ) => {
+                        let opts = PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        };
+                        match self.store.put_opts(&path, data.into(), opts).await {
+                            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+                            Err(e) => Err(backend_err(e)),
+                        }
+                    }
                     Err(e) => Err(backend_err(e)),
                 }
             }

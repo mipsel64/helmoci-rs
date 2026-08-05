@@ -8,7 +8,7 @@ use helmoci_storage::{
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    Attribute, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::{
@@ -119,6 +119,29 @@ async fn memory_backend_preserves_content_type() {
 }
 
 #[tokio::test]
+async fn memory_backend_persists_docker_content_digest_metadata() {
+    let store = Arc::new(InMemory::new());
+    let storage = ObjectStoreStorage::new(store.clone());
+    let digest = Digest::sha256(b"metadata");
+    storage
+        .put_blob(
+            &digest,
+            "application/octet-stream",
+            Bytes::from_static(b"metadata"),
+        )
+        .await
+        .unwrap();
+
+    let path = object_store::path::Path::from(blob_key(&digest));
+    let stored = store.get(&path).await.unwrap();
+    let key = Attribute::Metadata("docker-content-digest".into());
+    assert_eq!(
+        stored.attributes.get(&key).map(AsRef::as_ref),
+        Some(digest.as_str())
+    );
+}
+
+#[tokio::test]
 async fn corrupt_tag_pointer_is_a_cache_miss() {
     let store = Arc::new(InMemory::new());
     let storage = ObjectStoreStorage::new(store.clone());
@@ -141,9 +164,16 @@ async fn corrupt_tag_pointer_is_a_cache_miss() {
 #[derive(Debug)]
 struct InterleavingStore {
     inner: InMemory,
+    attribute_support: AttributeSupport,
     heads: AtomicUsize,
     second_head: Notify,
     first_write: Notify,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AttributeSupport {
+    None,
+    ContentType,
 }
 
 impl fmt::Display for InterleavingStore {
@@ -160,7 +190,15 @@ impl ObjectStore for InterleavingStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        if !opts.attributes.is_empty() {
+        let has_metadata = opts
+            .attributes
+            .iter()
+            .any(|(attribute, _)| matches!(attribute, Attribute::Metadata(_)));
+        let attributes_unsupported = match self.attribute_support {
+            AttributeSupport::None => !opts.attributes.is_empty(),
+            AttributeSupport::ContentType => has_metadata,
+        };
+        if attributes_unsupported {
             return Err(object_store::Error::NotImplemented);
         }
 
@@ -239,9 +277,37 @@ impl ObjectStore for InterleavingStore {
 }
 
 #[tokio::test]
+async fn metadata_fallback_preserves_content_type() {
+    let storage = ObjectStoreStorage::new(Arc::new(InterleavingStore {
+        inner: InMemory::new(),
+        attribute_support: AttributeSupport::ContentType,
+        heads: AtomicUsize::new(0),
+        second_head: Notify::new(),
+        first_write: Notify::new(),
+    }));
+    let digest = Digest::sha256(b"first");
+
+    storage
+        .put_blob(
+            &digest,
+            "application/octet-stream",
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .unwrap();
+
+    let blob = storage.get_blob(&digest).await.unwrap().unwrap();
+    assert_eq!(
+        blob.meta.content_type.as_deref(),
+        Some("application/octet-stream")
+    );
+}
+
+#[tokio::test]
 async fn concurrent_creates_do_not_overwrite_the_first_blob() {
     let storage = Arc::new(ObjectStoreStorage::new(Arc::new(InterleavingStore {
         inner: InMemory::new(),
+        attribute_support: AttributeSupport::None,
         heads: AtomicUsize::new(0),
         second_head: Notify::new(),
         first_write: Notify::new(),
