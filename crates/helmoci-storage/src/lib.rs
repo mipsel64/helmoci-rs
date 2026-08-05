@@ -1,8 +1,8 @@
 pub mod ephemeral;
-pub mod object_store_impl;
+pub mod objstore;
 
 pub use ephemeral::EphemeralStorage;
-pub use object_store_impl::ObjectStoreStorage;
+pub use objstore::ObjectStoreStorage;
 
 use async_trait::async_trait;
 use bytes::Bytes;
