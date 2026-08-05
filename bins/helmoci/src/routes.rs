@@ -71,10 +71,7 @@ async fn oci_dispatch(State(state): State<SharedState>, req: Request<Body>) -> R
             manifest_entry(&state, &proxy_host, &name, &reference, head_only).await
         }
         OciRoute::Blob { name, digest } => blob_entry(&state, &name, &digest, head_only).await,
-        OciRoute::Tags { name } => {
-            let _ = (&name, &query);
-            Err(AppError::NameUnknown("not implemented yet".into()))
-        }
+        OciRoute::Tags { name } => tags_entry(&state, &name, query.as_deref(), head_only).await,
         OciRoute::NotFound => Err(AppError::NameUnknown("unknown registry path".into())),
     };
     result.unwrap_or_else(IntoResponse::into_response)
@@ -106,6 +103,21 @@ async fn blob_entry(
 ) -> Result<Response, AppError> {
     match resolve_name(name, &state.cfg.aliases) {
         Some(Resolved::Classic(_)) => classic::blob(state, digest, head_only).await,
+        Some(Resolved::Oci(_)) => Err(AppError::Internal(
+            "oci pass-through is wired in a later task".into(),
+        )),
+        None => Err(AppError::NameUnknown(invalid_path_message(name))),
+    }
+}
+
+async fn tags_entry(
+    state: &SharedState,
+    name: &str,
+    query: Option<&str>,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    match resolve_name(name, &state.cfg.aliases) {
+        Some(Resolved::Classic(chart)) => classic::tags(state, chart, query, head_only).await,
         Some(Resolved::Oci(_)) => Err(AppError::Internal(
             "oci pass-through is wired in a later task".into(),
         )),

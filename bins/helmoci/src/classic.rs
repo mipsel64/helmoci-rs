@@ -1,6 +1,8 @@
 use crate::error::AppError;
 use crate::respond::{blob_response, bytes_response};
 use crate::state::AppState;
+use axum::body::Body;
+use axum::http::{StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -298,6 +300,67 @@ pub async fn blob(
         }
         None => Err(AppError::BlobUnknown(format!("blob unknown: {digest}"))),
     }
+}
+
+pub async fn tags(
+    state: &AppState,
+    chart: ClassicChart,
+    query: Option<&str>,
+    head_only: bool,
+) -> Result<Response, AppError> {
+    let index = fetch_index_text(state, &chart.repo_url, chart.source).await?;
+    let mut tags =
+        helmoci_core::helm::index::list_versions(&index, &chart.repo_url, &chart.chart_name)
+            .map_err(AppError::from_helm_for_tags)?;
+
+    let mut n_param = None;
+    let mut last = None;
+    if let Some(query) = query {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            match key.as_ref() {
+                "n" => n_param = value.parse().ok(),
+                "last" => last = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+    }
+    if let Some(last) = last
+        && let Some(index) = tags.iter().position(|tag| tag == &last)
+    {
+        tags.drain(..=index);
+    }
+
+    let mut link = None;
+    if let Some(n) = n_param
+        && tags.len() > n
+    {
+        let next_last = n.checked_sub(1).and_then(|index| tags.get(index)).cloned();
+        tags.truncate(n);
+        if let Some(next_last) = next_last {
+            let encoded: String =
+                url::form_urlencoded::byte_serialize(next_last.as_bytes()).collect();
+            link = Some(format!(
+                "</v2/{}/tags/list?n={}&last={}>; rel=\"next\"",
+                chart.full_name, n, encoded
+            ));
+        }
+    }
+
+    let body = serde_json::json!({ "name": chart.full_name, "tags": tags }).to_string();
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header("Docker-Distribution-API-Version", "registry/2.0");
+    if let Some(link) = link {
+        builder = builder.header(header::LINK, link);
+    }
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from(body)
+    };
+    Ok(builder.body(body).expect("static headers are valid"))
 }
 
 #[cfg(test)]
