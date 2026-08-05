@@ -381,7 +381,7 @@ mod tests {
     fn state() -> SharedState {
         let rc = parse_config("storage:\n  type: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
-        AppState::new(rc, storage).unwrap()
+        AppState::new(rc, storage, None).unwrap()
     }
 
     struct StaticResolver(Vec<SocketAddr>);
@@ -397,6 +397,10 @@ mod tests {
         let rc = parse_config("storage:\n  type: memory\nmax_chart_bytes: 1024\n").unwrap();
         let storage = build_storage(&rc.settings.storage).unwrap();
         let index_cache = moka::future::Cache::builder().max_capacity(32).build();
+        let upstream_tokens = moka::future::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(Duration::from_secs(240))
+            .build();
         let ephemeral = Arc::new(EphemeralStorage::new(1024, Duration::from_secs(60)));
         Arc::new(AppState {
             cfg: rc,
@@ -405,6 +409,8 @@ mod tests {
             http,
             public_http,
             index_cache,
+            gcp: None,
+            upstream_tokens,
         })
     }
 

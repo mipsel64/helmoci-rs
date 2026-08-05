@@ -13,12 +13,19 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub public_http: reqwest::Client,
     pub index_cache: moka::future::Cache<String, Arc<String>>,
+    pub gcp: Option<Arc<dyn crate::gcp::GcpTokenProvider>>,
+    /// Bearer tokens for upstream registries, keyed by registry|repo.
+    pub upstream_tokens: moka::future::Cache<String, String>,
 }
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    pub fn new(cfg: RuntimeConfig, storage: Arc<dyn Storage>) -> eyre::Result<SharedState> {
+    pub fn new(
+        cfg: RuntimeConfig,
+        storage: Arc<dyn Storage>,
+        gcp: Option<Arc<dyn crate::gcp::GcpTokenProvider>>,
+    ) -> eyre::Result<SharedState> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
@@ -27,6 +34,10 @@ impl AppState {
         let index_cache = moka::future::Cache::builder()
             .max_capacity(512)
             .time_to_live(Duration::from_secs(cfg.settings.index_cache_ttl_secs))
+            .build();
+        let upstream_tokens = moka::future::Cache::builder()
+            .max_capacity(256)
+            .time_to_live(Duration::from_secs(240))
             .build();
         let ephemeral = Arc::new(EphemeralStorage::new(
             cfg.settings.ephemeral_cache.max_bytes,
@@ -39,6 +50,8 @@ impl AppState {
             http,
             public_http,
             index_cache,
+            gcp,
+            upstream_tokens,
         }))
     }
 }
