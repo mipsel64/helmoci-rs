@@ -128,35 +128,32 @@ pub struct RuntimeConfig {
     pub classic_alias_by_repo: HashMap<String, String>,
 }
 
-pub fn interpolate_env(raw: &str) -> eyre::Result<String> {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            bail!("unterminated ${{...}} in config")
-        };
-        let var = &after[..end];
-        let val = std::env::var(var)
-            .wrap_err_with(|| format!("environment variable {var} is not set"))?;
-        out.push_str(&val);
-        rest = &after[end + 1..];
+fn env_context(name: &str) -> Result<Option<String>, std::env::VarError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
     }
-    out.push_str(rest);
-    Ok(out)
 }
 
 pub fn parse_config(raw_yaml: &str) -> eyre::Result<RuntimeConfig> {
-    let interpolated = interpolate_env(raw_yaml)?;
-    let settings: Config = serde_yaml_ng::from_str(&interpolated).wrap_err("invalid config")?;
+    let expanded =
+        shellexpand::env_with_context(raw_yaml, env_context).wrap_err("expanding configuration")?;
+    let settings = config::Config::builder()
+        .add_source(config::File::from_str(
+            expanded.as_ref(),
+            config::FileFormat::Yaml,
+        ))
+        .build()
+        .wrap_err("building configuration")?
+        .try_deserialize::<Config>()
+        .wrap_err("deserializing configuration")?;
     validate(settings)
 }
 
 pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
-    let raw = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("cannot read config file {path}"))?;
-    parse_config(&raw)
+    let raw =
+        std::fs::read_to_string(path).wrap_err_with(|| format!("reading config file {path}"))?;
+    parse_config(&raw).wrap_err_with(|| format!("loading config file {path}"))
 }
 
 fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
@@ -231,8 +228,49 @@ pub fn build_storage(cfg: &Backend) -> eyre::Result<Arc<dyn Storage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
 
     const MINIMAL: &str = "storage:\n  type: memory\n";
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let vars = keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect();
+            for key in keys {
+                unsafe { std::env::remove_var(key) };
+            }
+            Self { vars }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.vars {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn tagged_backends_deserialize() {
@@ -288,17 +326,48 @@ mod tests {
     }
 
     #[test]
-    fn interpolates_env_vars() {
-        unsafe { std::env::set_var("HELMOCI_TEST_TOKEN", "s3cret") };
-        let yaml = "storage:\n  type: memory\nauth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_TOKEN}\"]\n";
-        let rc = parse_config(yaml).unwrap();
-        assert_eq!(rc.settings.auth.tokens, vec!["s3cret"]);
+    fn expands_shell_references_before_deserializing() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&["HELMOCI_TEST_LISTEN", "HELMOCI_TEST_TOKEN"]);
+        env.set("HELMOCI_TEST_LISTEN", "127.0.0.1:9090");
+        env.set("HELMOCI_TEST_TOKEN", "secret-token");
+        let cfg = parse_config(concat!(
+            "listen: $HELMOCI_TEST_LISTEN\n",
+            "storage:\n  type: memory\n",
+            "auth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_TOKEN}\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings.listen, "127.0.0.1:9090");
+        assert_eq!(cfg.settings.auth.tokens, ["secret-token"]);
     }
 
     #[test]
-    fn missing_env_var_fails() {
-        let yaml = "storage:\n  type: memory\nauth:\n  tokens: [\"${HELMOCI_DOES_NOT_EXIST}\"]\n";
-        assert!(parse_config(yaml).is_err());
+    fn leaves_missing_shell_references_unexpanded() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new(&["HELMOCI_TEST_MISSING"]);
+        let cfg = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "auth:\n  tokens: [\"${HELMOCI_TEST_MISSING}\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings.auth.tokens, ["${HELMOCI_TEST_MISSING}"]);
+    }
+
+    #[test]
+    fn load_config_reads_exact_yaml_path_with_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helmoci.yaml");
+        std::fs::write(&path, "storage:\n  type: memory\n").unwrap();
+        let cfg = load_config(path.to_str().unwrap()).unwrap();
+        assert!(matches!(cfg.settings.storage, Backend::Memory));
+
+        let missing = dir.path().join("missing.yaml");
+        let error = match load_config(missing.to_str().unwrap()) {
+            Ok(_) => panic!("expected loading a missing config file to fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("reading config file"));
+        assert!(error.to_string().contains("missing.yaml"));
     }
 
     #[test]
