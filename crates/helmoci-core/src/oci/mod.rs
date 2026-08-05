@@ -1,3 +1,4 @@
+pub mod build;
 pub mod digest;
 pub mod route;
 
