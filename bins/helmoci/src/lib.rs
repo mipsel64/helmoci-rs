@@ -1,3 +1,4 @@
+pub mod classic;
 pub mod config;
 pub mod error;
 pub mod respond;
