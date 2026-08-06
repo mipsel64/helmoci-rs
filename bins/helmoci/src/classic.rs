@@ -939,9 +939,20 @@ mod tests {
             !url_lines.is_empty(),
             "expected the failure warning to log the sanitized upstream: {logs}"
         );
+        // The capturing subscriber is process-global, so concurrently running tests can
+        // land their own warnings here. Pin the set of events allowed to carry a URL
+        // rather than a single message, and enforce the sanitization invariant on every
+        // one of them — that invariant is what actually matters, and it holds no matter
+        // which test emitted the line.
         for line in url_lines {
             assert!(
-                line.contains("upstream Helm index request failed"),
+                [
+                    "upstream Helm index request failed",
+                    "upstream Helm index exceeded max_index_bytes",
+                    "upstream chart download failed",
+                ]
+                .iter()
+                .any(|allowed| line.contains(allowed)),
                 "unexpected URL in logs: {line}"
             );
             assert!(
