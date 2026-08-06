@@ -1,6 +1,25 @@
 # helmoci
 
-helmoci serves charts from classic Helm repositories and configured OCI upstream aliases behind one read-only OCI Distribution endpoint. It is a Rust port of [`tuananh/helmoci`](https://github.com/tuananh/helmoci).
+helmoci serves charts from classic Helm repositories and configured OCI upstream aliases behind one read-only OCI Distribution endpoint.
+
+## Credits and relationship to the original
+
+This project is inspired by, and a Rust port of, [**`tuananh/helmoci`**](https://github.com/tuananh/helmoci) by [Tuan Anh Tran](https://github.com/tuananh) — a TypeScript Cloudflare Worker that serves classic Helm chart repositories as a read-only OCI registry and caches the built artifacts in R2. All credit for the original idea, the request flow, and the artifact-building approach belongs there.
+
+The core behavior is deliberately faithful to the original: the same OCI media types, the same manifest/blob/tags endpoints, the same `Chart.yaml` and `Chart.lock` dependency rewriting, the same SSRF guards, and the same descriptive error messages. The storage key layout is **byte-compatible** with the original's R2 bucket (`blobs/sha256:<hex>` and `tags/<proxy-host>/<full-name>/<tag>` with the same camelCase tag-pointer JSON), so a bucket written by the TypeScript worker keeps working unchanged.
+
+What this port extends:
+
+| Extension | Original | This port |
+| --- | --- | --- |
+| Runtime | Cloudflare Worker | Standalone server (axum/tokio), shipped as a distroless container |
+| Storage | R2 only | Pluggable `Storage` trait: R2 (S3-compatible), GCS, local filesystem, in-memory, plus a bounded in-process ephemeral cache |
+| Aliases | — | Short names mapping to either a classic Helm repo or an upstream OCI registry |
+| OCI pass-through | — | Proxies an upstream `/v2` API with the Docker token flow, optional write-through caching, and Google Artifact Registry support via Application Default Credentials |
+| Pull authentication | — | Optional static tokens, accepted as Basic or Bearer, compared in constant time |
+| Operations | — | `/healthz`, Prometheus `/metrics`, structured `tracing` logs with credentials kept out of them |
+
+Push support, `_catalog`, and search are out of scope here, exactly as in the original.
 
 ## Quick start
 
