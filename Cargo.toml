@@ -32,7 +32,11 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# `tracing-log` is deliberately absent: the default feature set would let
+# `try_init` bridge the `log` facade into tracing, which is exactly what
+# `config::init_logging` refuses to do. Leaving it off makes that a compile-time
+# guarantee rather than a convention.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "json", "smallvec"] }
 clap = { version = "4", features = ["derive", "env"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
@@ -41,5 +45,7 @@ constant_time_eq = "0.4"
 base64 = "0.22"
 eyre = "0.6"
 wiremock = "0.6"
+# Test-only: asserting the `log` facade stays unbridged, see tests/logging_init.rs.
+log = "0.4"
 tempfile = "3"
 http-body-util = "0.1"

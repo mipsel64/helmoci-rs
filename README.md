@@ -61,6 +61,8 @@ The YAML document has these top-level keys. Unknown keys are rejected.
 | Key | Default | Description |
 | --- | --- | --- |
 | `listen` | `0.0.0.0:8080` | TCP address on which the HTTP server listens. |
+| `log.level` | `info` | `tracing` filter directives, either a bare level or a per-target list such as `warn,helmoci=debug`. `LOG_LEVEL`, then `RUST_LOG`, override it. |
+| `log.format` | `compact` | Event layout: `compact`, `full`, `pretty`, or `json`. `LOG_FORMAT` overrides it. |
 | `max_chart_bytes` | `52428800` (50 MiB) | Maximum size for classic chart downloads and buffered OCI responses. |
 | `max_expanded_chart_bytes` | `524288000` (500 MiB) | Maximum total uncompressed size of an expanded chart archive. Charts expand well beyond their download size, so this is deliberately larger than `max_chart_bytes` and must never be smaller than it. |
 | `max_index_bytes` | `67108864` (64 MiB) | Maximum size of a downloaded classic `index.yaml`. Large public indexes exceed the chart limit, so the index has its own bound. Must be greater than zero. |
