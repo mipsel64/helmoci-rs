@@ -95,13 +95,21 @@ async fn native_tracing_reports_token_redirect_and_cache_events_without_secrets(
     let output = Arc::new(Mutex::new(Vec::new()));
     let writer_output = output.clone();
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("helmoci=debug"))
+        // Every target, not just helmoci's: the sentinel assertions below claim no
+        // URL reaches the logs, which a production `RUST_LOG=debug` would test
+        // against dependency events too.
+        .with_env_filter(EnvFilter::new("debug"))
         .with_ansi(false)
         .without_time()
         .with_target(false)
         .with_writer(move || SharedWriter(writer_output.clone()))
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
+    // Under the old `helmoci=debug` filter this was dropped, which is what made
+    // the sentinel assertions below unable to say anything about anyone else's
+    // events. Note that dependencies logging through the `log` facade are absent
+    // for a different reason: no bridge is installed, here or in `main`.
+    tracing::debug!(target: "not_helmoci", "dependency target event");
     let cfg = format!(
         concat!(
             "storage:\n  type: memory\n",
@@ -146,6 +154,10 @@ async fn native_tracing_reports_token_redirect_and_cache_events_without_secrets(
     }
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("dependency target event"),
+        "the filter must cover every target, not just helmoci's: {logs}"
+    );
     for event in [
         "OCI cache miss",
         "OCI cache hit",

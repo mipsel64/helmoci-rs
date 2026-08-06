@@ -278,10 +278,25 @@ async fn upstream_failure_responses_do_not_expose_url_credentials_or_queries() {
         "INDEX_USER_SENTINEL",
         "INDEX_PASSWORD_SENTINEL",
         "INDEX_QUERY_SENTINEL",
+        "@",
+        "?",
+        // `test` is a configured alias, which exists to hide its upstream: the
+        // operator may have pointed it at an internal repo, so a 502 must not
+        // disclose the origin or path. Operators get it from the warn log instead.
         authority,
+        "http://",
     ] {
         assert!(!body.contains(secret), "response leaked {secret:?}: {body}");
     }
+    // Still actionable: the status and who can fix it.
+    assert!(
+        body.contains("500"),
+        "response does not name the status: {body}"
+    );
+    assert!(
+        body.contains("operator"),
+        "response does not say who can fix it: {body}"
+    );
     server.verify().await;
 }
 
@@ -318,9 +333,24 @@ async fn chart_failure_responses_do_not_expose_signed_urls_or_userinfo() {
         "CHART_USER_SENTINEL",
         "CHART_PASSWORD_SENTINEL",
         "CHART_QUERY_SENTINEL",
-        &chart_url,
+        chart_url.as_str(),
+        "@",
+        "?",
+        // Same alias rule as the index case: the chart URL came from the hidden
+        // upstream's index.yaml, so it must not reach the client either.
+        authority,
+        "demo.tgz",
+        "http://",
     ] {
         assert!(!body.contains(secret), "response leaked {secret:?}: {body}");
     }
+    assert!(
+        body.contains("500"),
+        "response does not name the status: {body}"
+    );
+    assert!(
+        body.contains("operator"),
+        "response does not say who can fix it: {body}"
+    );
     server.verify().await;
 }

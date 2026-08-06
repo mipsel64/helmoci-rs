@@ -115,8 +115,17 @@ pub fn parse_alias_upstream(s: &str) -> Result<AliasUpstream, String> {
 }
 
 /// `host[/path]` key used to match dependency URLs against classic alias upstreams.
+///
+/// URLs with a non-default port have no key: the key is also the host-path OCI name
+/// (`oci://proxy/<host>/<path>`), which cannot carry a port, so keying on the host
+/// alone would rewrite `host:8443` to a name that later resolves to `host:443` — a
+/// different server — and would let a ported alias capture the unported dependency
+/// of the same name. Upstream helmoci has the same hole (it keys on `parsed.hostname`).
 pub fn normalize_repo_key(url_str: &str) -> Option<String> {
     let parsed = url::Url::parse(url_str).ok()?;
+    if parsed.port().is_some() {
+        return None;
+    }
     let host = parsed.host_str()?.to_ascii_lowercase();
     let path = parsed.path().trim_matches('/');
     Some(if path.is_empty() {
@@ -225,9 +234,9 @@ mod tests {
             },
         );
         m.insert(
-            "meteora".to_string(),
+            "acme".to_string(),
             Alias {
-                upstream: parse_alias_upstream("oci://asia-docker.pkg.dev/meteora-ops/charts")
+                upstream: parse_alias_upstream("oci://asia-docker.pkg.dev/example-project/charts")
                     .unwrap(),
                 store: false,
                 auth: UpstreamAuthKind::Gcp,
@@ -246,10 +255,10 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_alias_upstream("oci://asia-docker.pkg.dev/meteora-ops/charts").unwrap(),
+            parse_alias_upstream("oci://asia-docker.pkg.dev/example-project/charts").unwrap(),
             AliasUpstream::Oci {
                 registry: "asia-docker.pkg.dev".into(),
-                repo: "meteora-ops/charts".into()
+                repo: "example-project/charts".into()
             }
         );
         assert!(parse_alias_upstream("ftp://x.io").is_err());
@@ -313,36 +322,36 @@ mod tests {
 
     #[test]
     fn resolves_oci_alias() {
-        let r = resolve_name("meteora/generic-app", &aliases()).unwrap();
+        let r = resolve_name("acme/generic-app", &aliases()).unwrap();
         assert_eq!(
             r,
             Resolved::Oci(OciTarget {
                 registry: "asia-docker.pkg.dev".into(),
-                repo: "meteora-ops/charts/generic-app".into(),
-                full_name: "meteora/generic-app".into(),
+                repo: "example-project/charts/generic-app".into(),
+                full_name: "acme/generic-app".into(),
                 store: false,
                 auth: UpstreamAuthKind::Gcp,
                 plain_http: false,
             })
         );
-        assert!(resolve_name("meteora", &aliases()).is_none());
+        assert!(resolve_name("acme", &aliases()).is_none());
     }
 
     #[test]
     fn oci_aliases_reject_decoded_path_escapes_but_allow_nesting() {
         for name in [
-            "meteora/./chart",
-            "meteora/../private",
-            "meteora/nested/../private",
-            "meteora/nested\\private",
-            "meteora/nested?private",
-            "meteora/nested#private",
-            "meteora/nested\u{1f}private",
+            "acme/./chart",
+            "acme/../private",
+            "acme/nested/../private",
+            "acme/nested\\private",
+            "acme/nested?private",
+            "acme/nested#private",
+            "acme/nested\u{1f}private",
         ] {
             assert!(resolve_name(name, &aliases()).is_none(), "{name:?}");
         }
         assert!(matches!(
-            resolve_name("meteora/team/nested/chart.v2", &aliases()),
+            resolve_name("acme/team/nested/chart.v2", &aliases()),
             Some(Resolved::Oci(_))
         ));
     }
@@ -353,7 +362,7 @@ mod tests {
         assert!(is_valid_chart_name("chart.v2_x"));
         assert!(!is_valid_chart_name("-bad"));
         assert!(!is_valid_chart_name(""));
-        assert!(is_valid_alias_name("meteora"));
+        assert!(is_valid_alias_name("acme"));
         assert!(!is_valid_alias_name("has.dot"));
         assert!(!is_valid_alias_name(""));
     }
@@ -366,5 +375,47 @@ mod tests {
             Some(&"argo".to_string())
         );
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn repo_keys_skip_non_default_ports() {
+        assert_eq!(
+            normalize_repo_key("https://charts.example.com/x"),
+            Some("charts.example.com/x".to_string())
+        );
+        // Default ports are not part of the key, so they stay rewritable.
+        assert_eq!(
+            normalize_repo_key("https://charts.example.com:443/x"),
+            Some("charts.example.com/x".to_string())
+        );
+        assert_eq!(
+            normalize_repo_key("http://charts.example.com:80/x"),
+            Some("charts.example.com/x".to_string())
+        );
+        // A host-path OCI name cannot carry a port: keying on the host alone would
+        // send "charts.example.com:8443" to port 443, a different server.
+        assert_eq!(
+            normalize_repo_key("https://charts.example.com:8443/x"),
+            None
+        );
+        assert_eq!(normalize_repo_key("https://charts.example.com:8443"), None);
+    }
+
+    #[test]
+    fn ported_alias_upstreams_stay_out_of_the_rewrite_map() {
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "internal".to_string(),
+            Alias {
+                upstream: parse_alias_upstream("https://charts.internal.example:8443/x").unwrap(),
+                store: true,
+                auth: UpstreamAuthKind::None,
+                plain_http: false,
+            },
+        );
+
+        // Otherwise the key would be "charts.internal.example/x" and the unported
+        // dependency of the same name would be routed to the :8443 upstream.
+        assert!(classic_alias_rewrite_map(&aliases).is_empty());
     }
 }

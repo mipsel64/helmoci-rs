@@ -18,6 +18,8 @@ pub struct BuiltChart {
     pub rewrites: Vec<Rewrite>,
 }
 
+/// Test-only: production callers must pass limits derived from config.
+#[cfg(test)]
 pub fn build_helm_oci_chart(
     chart_tgz: Vec<u8>,
     ctx: &RewriteContext,
@@ -122,7 +124,7 @@ mod tests {
     #[test]
     fn bounded_build_rejects_oversized_archive_entry() {
         let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
-        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+        let limits = crate::helm::tgz::ArchiveLimits::new(64, 4, 8);
 
         let error = build_helm_oci_chart_with_limits(tgz, &ctx(), limits)
             .err()

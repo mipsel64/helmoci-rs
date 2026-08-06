@@ -9,7 +9,7 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{
     Attribute, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::{
     fmt,
@@ -165,9 +165,34 @@ async fn corrupt_tag_pointer_is_a_cache_miss() {
 struct InterleavingStore {
     inner: InMemory,
     attribute_support: AttributeSupport,
+    /// When set, no `head` returns until both writers have issued theirs, so the
+    /// existence pre-check cannot be what serialises two concurrent writes.
+    head_gate: Option<HeadGate>,
+    first_write: Notify,
+}
+
+#[derive(Debug, Default)]
+struct HeadGate {
     heads: AtomicUsize,
     second_head: Notify,
-    first_write: Notify,
+}
+
+impl InterleavingStore {
+    fn new(attribute_support: AttributeSupport) -> Self {
+        Self {
+            inner: InMemory::new(),
+            attribute_support,
+            head_gate: None,
+            first_write: Notify::new(),
+        }
+    }
+
+    fn with_head_gate(attribute_support: AttributeSupport) -> Self {
+        Self {
+            head_gate: Some(HeadGate::default()),
+            ..Self::new(attribute_support)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -233,10 +258,12 @@ impl ObjectStore for InterleavingStore {
     }
 
     async fn head(&self, location: &object_store::path::Path) -> object_store::Result<ObjectMeta> {
-        if self.heads.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.second_head.notified().await;
-        } else {
-            self.second_head.notify_one();
+        if let Some(gate) = &self.head_gate {
+            if gate.heads.fetch_add(1, Ordering::SeqCst) == 0 {
+                gate.second_head.notified().await;
+            } else {
+                gate.second_head.notify_one();
+            }
         }
         self.inner.head(location).await
     }
@@ -278,13 +305,9 @@ impl ObjectStore for InterleavingStore {
 
 #[tokio::test]
 async fn metadata_fallback_preserves_content_type() {
-    let storage = ObjectStoreStorage::new(Arc::new(InterleavingStore {
-        inner: InMemory::new(),
-        attribute_support: AttributeSupport::ContentType,
-        heads: AtomicUsize::new(0),
-        second_head: Notify::new(),
-        first_write: Notify::new(),
-    }));
+    let storage = ObjectStoreStorage::new(Arc::new(InterleavingStore::new(
+        AttributeSupport::ContentType,
+    )));
     let digest = Digest::sha256(b"first");
 
     storage
@@ -305,13 +328,9 @@ async fn metadata_fallback_preserves_content_type() {
 
 #[tokio::test]
 async fn concurrent_creates_do_not_overwrite_the_first_blob() {
-    let storage = Arc::new(ObjectStoreStorage::new(Arc::new(InterleavingStore {
-        inner: InMemory::new(),
-        attribute_support: AttributeSupport::None,
-        heads: AtomicUsize::new(0),
-        second_head: Notify::new(),
-        first_write: Notify::new(),
-    })));
+    let storage = Arc::new(ObjectStoreStorage::new(Arc::new(
+        InterleavingStore::with_head_gate(AttributeSupport::None),
+    )));
     let digest = Digest::sha256(b"first");
 
     let (first, second) = tokio::join!(
@@ -331,6 +350,432 @@ async fn concurrent_creates_do_not_overwrite_the_first_blob() {
 
     let blob = storage.get_blob(&digest).await.unwrap().unwrap();
     assert_eq!(collect(blob).await, b"first");
+}
+
+const SENTINEL_ENDPOINT: &str = "https://acct-8f31c0a2.r2.cloudflarestorage.com";
+const SENTINEL_BUCKET: &str = "helmoci-private-cache";
+const SENTINEL_BODY: &str = "InvalidAccessKeyId: the access key id you provided expired";
+
+/// Stands in for object_store's `RetryError`, whose `Display` embeds the request
+/// URI and the upstream response body.
+#[derive(Debug)]
+struct LeakyDetail(String);
+
+impl fmt::Display for LeakyDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LeakyDetail {}
+
+fn leaky_error(method: &str, location: &object_store::path::Path) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "FaultyStore",
+        source: Box::new(LeakyDetail(format!(
+            "Error performing {method} {SENTINEL_ENDPOINT}/{SENTINEL_BUCKET}/{location} \
+             in 1.2s, after 3 retries - Server returned error response: {SENTINEL_BODY}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Failure {
+    /// Nothing fails; the store only counts writes by mode.
+    None,
+    /// Every operation fails with an error naming the endpoint, bucket and key.
+    Leaky,
+    /// Conditional creates are rejected outright: an S3-compatible endpoint that
+    /// does not implement `If-None-Match: *` answers 400/501 and a
+    /// `LocalFileSystem` on a volume without hard links fails the link, both of
+    /// which reach us as `Error::Generic`. Unconditional writes work.
+    NoConditionalCreate,
+    /// Conditional creates fail for a reason that is not a missing capability.
+    ExpiredCredentials,
+    /// `get` understates the object size but streams the whole body.
+    LyingObjectSize,
+}
+
+#[derive(Debug)]
+struct FaultyStore {
+    inner: InMemory,
+    failure: Failure,
+    creates: AtomicUsize,
+    overwrites: AtomicUsize,
+}
+
+impl FaultyStore {
+    fn new(failure: Failure) -> Self {
+        Self {
+            inner: InMemory::new(),
+            failure,
+            creates: AtomicUsize::new(0),
+            overwrites: AtomicUsize::new(0),
+        }
+    }
+
+    fn creates(&self) -> usize {
+        self.creates.load(Ordering::SeqCst)
+    }
+
+    fn overwrites(&self) -> usize {
+        self.overwrites.load(Ordering::SeqCst)
+    }
+}
+
+impl fmt::Display for FaultyStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("faulty-store")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FaultyStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let conditional = matches!(opts.mode, PutMode::Create);
+        if conditional {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.overwrites.fetch_add(1, Ordering::SeqCst);
+        }
+        match (self.failure, conditional) {
+            (Failure::Leaky, _) => Err(leaky_error("PUT", location)),
+            (Failure::NoConditionalCreate, true) => Err(object_store::Error::Generic {
+                store: "FaultyStore",
+                source: "this endpoint does not implement conditional writes".into(),
+            }),
+            (Failure::ExpiredCredentials, true) => Err(object_store::Error::PermissionDenied {
+                path: location.to_string(),
+                source: "credentials expired".into(),
+            }),
+            _ => self.inner.put_opts(location, payload, opts).await,
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        match self.failure {
+            Failure::Leaky => Err(leaky_error("GET", location)),
+            Failure::LyingObjectSize => {
+                let mut result = self.inner.get_opts(location, options).await?;
+                result.meta.size = 1;
+                result.range = 0..1;
+                Ok(result)
+            }
+            _ => self.inner.get_opts(location, options).await,
+        }
+    }
+
+    async fn head(&self, location: &object_store::path::Path) -> object_store::Result<ObjectMeta> {
+        match self.failure {
+            Failure::Leaky => Err(leaky_error("HEAD", location)),
+            _ => self.inner.head(location).await,
+        }
+    }
+
+    async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+fn assert_redacted(error: &helmoci_storage::StorageError, secrets: &[&str]) {
+    let message = error.to_string();
+    for secret in secrets {
+        assert!(
+            !message.contains(secret),
+            "client-visible message leaked {secret:?}: {message}"
+        );
+    }
+    assert!(
+        message.len() < 64,
+        "client-visible message grew long enough to be carrying detail: {message}"
+    );
+}
+
+fn detail(error: &helmoci_storage::StorageError) -> String {
+    std::error::Error::source(error)
+        .map(ToString::to_string)
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn backend_errors_are_redacted_before_they_reach_a_client() {
+    let storage = ObjectStoreStorage::new(Arc::new(FaultyStore::new(Failure::Leaky)));
+    let digest = Digest::sha256(b"leak");
+    let scope = TagScope {
+        proxy_host: "charts.example.com",
+        full_name: "argoproj.github.io/argo-helm/argo-cd",
+    };
+    let ptr = TagPointer {
+        digest: digest.clone(),
+        media_type: MEDIA_TYPE_MANIFEST.to_string(),
+        size: 4,
+    };
+
+    let errors = [
+        storage.get_blob(&digest).await.err().unwrap(),
+        storage.head_blob(&digest).await.err().unwrap(),
+        storage
+            .put_blob(
+                &digest,
+                "application/octet-stream",
+                Bytes::from_static(b"leak"),
+            )
+            .await
+            .err()
+            .unwrap(),
+        storage
+            .get_tag_pointer(&scope, "7.7.0")
+            .await
+            .err()
+            .unwrap(),
+        storage
+            .put_tag_pointer(&scope, "7.7.0", &ptr)
+            .await
+            .err()
+            .unwrap(),
+    ];
+
+    for error in &errors {
+        assert_redacted(
+            error,
+            &[
+                SENTINEL_ENDPOINT,
+                SENTINEL_BUCKET,
+                SENTINEL_BODY,
+                "argo",
+                "blobs/",
+                "tags/",
+                digest.as_str(),
+            ],
+        );
+        let detail = detail(error);
+        assert!(
+            detail.contains(SENTINEL_ENDPOINT) && detail.contains(SENTINEL_BODY),
+            "operators lost the backend detail: {detail}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rejected_keys_are_redacted_before_they_reach_a_client() {
+    let storage = ObjectStoreStorage::new(Arc::new(InMemory::new()));
+    // A `Host: ..` request makes the key unparseable; the key carries the proxy
+    // host and the chart name, so it must not come back in the response.
+    let scope = TagScope {
+        proxy_host: "..",
+        full_name: "argoproj.github.io/argo-helm/argo-cd",
+    };
+
+    let error = storage
+        .get_tag_pointer(&scope, "7.7.0")
+        .await
+        .err()
+        .unwrap();
+
+    assert_redacted(&error, &["..", "argo", "tags/", "7.7.0"]);
+    assert!(
+        detail(&error).contains("argo-cd"),
+        "operators lost the rejected key: {}",
+        detail(&error)
+    );
+}
+
+#[tokio::test]
+async fn put_blob_falls_back_to_an_unconditional_write() {
+    let store = Arc::new(FaultyStore::new(Failure::NoConditionalCreate));
+    let storage = ObjectStoreStorage::new(store.clone());
+    let digest = Digest::sha256(b"portable");
+    let ct = "application/octet-stream";
+
+    storage
+        .put_blob(&digest, ct, Bytes::from_static(b"portable"))
+        .await
+        .unwrap();
+
+    let blob = storage.get_blob(&digest).await.unwrap().unwrap();
+    assert_eq!(collect(blob).await, b"portable");
+    assert_eq!(store.creates(), 1);
+    assert_eq!(store.overwrites(), 1);
+
+    // The fallback must not become a clobber: a second put of the same digest is
+    // still a no-op, so bytes already stored survive.
+    storage
+        .put_blob(&digest, ct, Bytes::from_static(b"replaced"))
+        .await
+        .unwrap();
+    assert_eq!(store.creates(), 1);
+    assert_eq!(store.overwrites(), 1);
+    let blob = storage.get_blob(&digest).await.unwrap().unwrap();
+    assert_eq!(collect(blob).await, b"portable");
+}
+
+#[tokio::test]
+async fn put_blob_does_not_downgrade_a_credential_failure_to_an_overwrite() {
+    let store = Arc::new(FaultyStore::new(Failure::ExpiredCredentials));
+    let storage = ObjectStoreStorage::new(store.clone());
+    let digest = Digest::sha256(b"denied");
+
+    storage
+        .put_blob(
+            &digest,
+            "application/octet-stream",
+            Bytes::from_static(b"denied"),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(store.creates(), 1);
+    assert_eq!(
+        store.overwrites(),
+        0,
+        "a non-capability failure must not downgrade the conditional write"
+    );
+    assert!(storage.get_blob(&digest).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_blob_skips_the_upload_when_the_digest_is_already_stored() {
+    let store = Arc::new(FaultyStore::new(Failure::None));
+    let storage = ObjectStoreStorage::new(store.clone());
+    let digest = Digest::sha256(b"cached");
+    let ct = "application/octet-stream";
+
+    storage
+        .put_blob(&digest, ct, Bytes::from_static(b"cached"))
+        .await
+        .unwrap();
+    assert_eq!(store.creates(), 1);
+
+    storage
+        .put_blob(&digest, ct, Bytes::from_static(b"cached"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.creates(),
+        1,
+        "an already-stored digest must not be uploaded again"
+    );
+    assert_eq!(store.overwrites(), 0);
+}
+
+fn padded_pointer(digest: &Digest, padding: usize) -> Vec<u8> {
+    format!(
+        r#"{{"digest":"{digest}","mediaType":"{MEDIA_TYPE_MANIFEST}","size":5,"padding":"{}"}}"#,
+        "x".repeat(padding)
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn oversized_tag_pointer_is_a_cache_miss() {
+    let store = Arc::new(InMemory::new());
+    let storage = ObjectStoreStorage::new(store.clone());
+    let scope = TagScope {
+        proxy_host: "proxy.test",
+        full_name: "a.io/b/c",
+    };
+    let digest = Digest::sha256(b"hello");
+
+    // Padding alone is parseable, so what follows is about size, not syntax.
+    store
+        .put(
+            &object_store::path::Path::from(tag_key(&scope, "small")),
+            padded_pointer(&digest, 16).into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .get_tag_pointer(&scope, "small")
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    store
+        .put(
+            &object_store::path::Path::from(tag_key(&scope, "bloated")),
+            padded_pointer(&digest, 512 * 1024).into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        storage.get_tag_pointer(&scope, "bloated").await.unwrap(),
+        None,
+        "an oversized object under tags/ must be a cache miss, not a buffered read"
+    );
+}
+
+#[tokio::test]
+async fn tag_pointer_reads_stay_bounded_when_the_backend_understates_the_size() {
+    let store = Arc::new(FaultyStore::new(Failure::LyingObjectSize));
+    let storage = ObjectStoreStorage::new(store.clone());
+    let scope = TagScope {
+        proxy_host: "proxy.test",
+        full_name: "a.io/b/c",
+    };
+    let digest = Digest::sha256(b"hello");
+    store
+        .inner
+        .put(
+            &object_store::path::Path::from(tag_key(&scope, "liar")),
+            padded_pointer(&digest, 512 * 1024).into(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        storage.get_tag_pointer(&scope, "liar").await.unwrap(),
+        None,
+        "the read must be bounded by what was actually streamed, not by the metadata"
+    );
 }
 
 #[test]

@@ -875,6 +875,7 @@ dependencies = [
  "gcp_auth",
  "helmoci-core",
  "helmoci-storage",
+ "hex",
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",
@@ -883,6 +884,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "shellexpand",
  "tar",
  "tempfile",
@@ -926,6 +928,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

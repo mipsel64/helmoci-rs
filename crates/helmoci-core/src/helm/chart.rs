@@ -1,11 +1,13 @@
 use super::HelmError;
 use super::tgz::{ArchiveLimits, is_root_chart_file, unpack_tgz_with_limits};
 
-/// Root Chart.yaml re-encoded as JSON — the OCI config blob for a Helm chart.
+/// Test-only: production callers must pass limits derived from config.
+#[cfg(test)]
 pub fn chart_config_from_tgz(tgz: &[u8]) -> Result<Vec<u8>, HelmError> {
     chart_config_from_tgz_with_limits(tgz, ArchiveLimits::default())
 }
 
+/// Root Chart.yaml re-encoded as JSON — the OCI config blob for a Helm chart.
 pub fn chart_config_from_tgz_with_limits(
     tgz: &[u8],
     limits: ArchiveLimits,
@@ -66,7 +68,7 @@ mod tests {
     #[test]
     fn bounded_chart_config_rejects_oversized_archive_entry() {
         let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
-        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+        let limits = crate::helm::tgz::ArchiveLimits::new(64, 4, 8);
 
         let error = chart_config_from_tgz_with_limits(&tgz, limits).unwrap_err();
 

@@ -67,6 +67,39 @@ async fn paginates_with_n_and_last() {
     assert_eq!(v["tags"], serde_json::json!(["1.1.0", "1.0.0"]));
 }
 
+/// index.yaml is bounded by `max_index_bytes`, not by the chart download cap: real
+/// repository indexes run far past any sane chart size, and bounding them by
+/// `max_chart_bytes` failed every tags/list against them with 413.
+#[tokio::test]
+async fn lists_versions_from_an_index_larger_than_the_chart_cap() {
+    let server = MockServer::start().await;
+    let index = format!(
+        "{}\nentries:\n  demo:\n    - {{name: demo, version: 1.0.0, urls: [z.tgz]}}\n",
+        "#".repeat(4096)
+    );
+    Mock::given(method("GET"))
+        .and(path("/index.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(index))
+        .mount(&server)
+        .await;
+    let app = common::app(&format!(
+        concat!(
+            "storage:\n  type: memory\n",
+            "max_chart_bytes: 1024\n",
+            "max_index_bytes: 65536\n",
+            "aliases:\n  test:\n    upstream: {uri}\n    store: true\n",
+        ),
+        uri = server.uri()
+    ));
+
+    let (status, _, body) =
+        common::send(&app, "GET", "/v2/test/demo/tags/list", "proxy.test").await;
+
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["tags"], serde_json::json!(["1.0.0"]));
+}
+
 #[tokio::test]
 async fn unknown_chart_is_name_unknown() {
     let server = MockServer::start().await;

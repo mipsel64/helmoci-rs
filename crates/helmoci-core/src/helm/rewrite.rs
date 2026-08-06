@@ -50,8 +50,8 @@ pub fn rewrite_dependency_url(repo_url: &str, ctx: &RewriteContext) -> Option<St
     Some(format!("oci://{}/{}", ctx.proxy_host, key))
 }
 
-/// Rewrite Chart.yaml (and Chart.lock) dependency repos to oci:// proxy URLs.
-/// Comments in the YAML are lost on rewrite — same behavior as upstream helmoci.
+/// Test-only: production callers must pass limits derived from config.
+#[cfg(test)]
 pub fn rewrite_chart_dependencies(
     tgz: &[u8],
     ctx: &RewriteContext,
@@ -59,6 +59,8 @@ pub fn rewrite_chart_dependencies(
     rewrite_chart_dependencies_with_limits(tgz, ctx, ArchiveLimits::default())
 }
 
+/// Rewrite Chart.yaml (and Chart.lock) dependency repos to oci:// proxy URLs.
+/// Comments in the YAML are lost on rewrite — same behavior as upstream helmoci.
 pub fn rewrite_chart_dependencies_with_limits(
     tgz: &[u8],
     ctx: &RewriteContext,
@@ -218,6 +220,47 @@ mod tests {
         }
     }
 
+    /// The proxy name form has nowhere to put a port, so a ported dependency must be
+    /// left pointing at its own upstream instead of being sent to port 443.
+    #[test]
+    fn skips_dependencies_with_a_non_default_port() {
+        assert!(
+            rewrite_dependency_url("https://charts.example.com:8443/x", &ctx()).is_none(),
+            "ported dependency must not be rewritten"
+        );
+        assert_eq!(
+            rewrite_dependency_url("https://charts.example.com:443/x", &ctx()).unwrap(),
+            "oci://proxy.test/charts.example.com/x"
+        );
+    }
+
+    #[test]
+    fn ported_alias_upstream_does_not_capture_the_unported_dependency() {
+        use crate::resolver::{
+            Alias, UpstreamAuthKind, classic_alias_rewrite_map, parse_alias_upstream,
+        };
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "internal".to_string(),
+            Alias {
+                upstream: parse_alias_upstream("https://charts.internal.example:8443/x").unwrap(),
+                store: true,
+                auth: UpstreamAuthKind::None,
+                plain_http: false,
+            },
+        );
+        let ctx = RewriteContext {
+            proxy_host: "proxy.test".to_string(),
+            classic_alias_by_repo: classic_alias_rewrite_map(&aliases),
+        };
+
+        assert_eq!(
+            rewrite_dependency_url("https://charts.internal.example/x", &ctx).unwrap(),
+            "oci://proxy.test/charts.internal.example/x"
+        );
+    }
+
     #[test]
     fn rewrites_chart_and_lock_in_tgz() {
         let chart_yaml = concat!(
@@ -281,7 +324,7 @@ mod tests {
     #[test]
     fn bounded_rewrite_rejects_oversized_archive_entry() {
         let tgz = build_chart_tgz(&[("demo/Chart.yaml", "12345")]);
-        let limits = crate::helm::tgz::ArchiveLimits::for_chart_bytes(4);
+        let limits = crate::helm::tgz::ArchiveLimits::new(64, 4, 8);
 
         let error = rewrite_chart_dependencies_with_limits(&tgz, &ctx(), limits)
             .err()

@@ -117,7 +117,9 @@ pub(crate) async fn send(
                 success = true,
                 "upstream request complete"
             ),
-            Err(_) => tracing::debug!(
+            // A transport failure is the one upstream outcome an operator has to see
+            // without turning debug logging on.
+            Err(_) => tracing::warn!(
                 kind = kind.label(),
                 success = false,
                 "upstream request complete"
@@ -130,6 +132,11 @@ pub(crate) async fn send(
             return Ok(response);
         }
         if followed == MAX_REDIRECTS {
+            tracing::warn!(
+                kind = kind.label(),
+                hops = followed,
+                "upstream redirect limit exceeded"
+            );
             return Err(AppError::Upstream(
                 "upstream redirect limit exceeded".into(),
             ));

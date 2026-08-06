@@ -8,11 +8,65 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use helmoci_core::oci::{Digest, TagPointer};
+use std::fmt;
 
+/// The storage operation that failed.
+///
+/// A closed vocabulary on purpose: it is the only thing [`StorageError`] renders,
+/// so a key, bucket or endpoint can never be smuggled in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOp {
+    BlobRead,
+    BlobStat,
+    BlobWrite,
+    TagRead,
+    TagWrite,
+}
+
+impl fmt::Display for StorageOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            StorageOp::BlobRead => "blob read",
+            StorageOp::BlobStat => "blob stat",
+            StorageOp::BlobWrite => "blob write",
+            StorageOp::TagRead => "tag pointer read",
+            StorageOp::TagWrite => "tag pointer write",
+        })
+    }
+}
+
+/// A storage failure, redacted so it is safe to show a client.
+///
+/// The server renders `to_string()` into the `message` of an OCI error body that
+/// anonymous pull clients receive, while backend errors carry the bucket
+/// endpoint, account id, object key and the upstream response body. So `Display`
+/// renders nothing but the operation, and the backend text reaches operators two
+/// other ways: it is logged inside this crate when the error is built, and it is
+/// kept as [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("storage backend error: {0}")]
-    Backend(String),
+    #[error("storage backend error ({op})")]
+    Backend {
+        op: StorageOp,
+        /// Operator-only detail. It names the endpoint, bucket and key, so it
+        /// must never be formatted into a response body.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+}
+
+impl StorageError {
+    /// Logs `error` for operators and wraps it in a client-safe error.
+    pub fn backend<E>(op: StorageOp, error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        tracing::warn!(operation = %op, error = %error, "storage backend error");
+        Self::Backend {
+            op,
+            source: Box::new(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -5,11 +5,26 @@ storage:
   settings:
     path: /tmp/helmoci-cache
 
+# Size limits (defaults shown).
+# max_chart_bytes: 52428800
+# max_expanded_chart_bytes: 524288000
+# max_index_bytes: 67108864
+
+# Pull authentication. Required as soon as an alias authenticates upstream,
+# because helmoci then republishes that upstream under its own auth model.
+# auth:
+#   enabled: true
+#   tokens:
+#     - ${HELMOCI_PULL_TOKEN}
+
 aliases:
   argo:
     upstream: https://argoproj.github.io/argo-helm
     store: true
-  # upstream-oci:
-  #   upstream: oci://registry.example.com/team/charts
+  # An OCI alias that authenticates with Google Application Default Credentials.
+  # Only ever point `auth: gcp` at a Google Artifact Registry host, and enable
+  # auth above first (or accept the unsafe allow_public_private_upstreams flag).
+  # acme:
+  #   upstream: oci://asia-docker.pkg.dev/example-project/charts
   #   auth: gcp
   #   store: false

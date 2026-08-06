@@ -1,4 +1,4 @@
-use crate::{Blob, BlobMeta, Storage, StorageError, TagScope, blob_key, tag_key};
+use crate::{Blob, BlobMeta, Storage, StorageError, StorageOp, TagScope, blob_key, tag_key};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -13,7 +13,16 @@ struct Entry {
 }
 
 /// Size-weighted, TTL-evicted in-memory storage. Backs `store: false` classic
-/// aliases; single-replica only.
+/// aliases.
+///
+/// Single-replica only, and that is a deployment caveat rather than an
+/// implementation detail: the cache lives in this process's heap, so nothing is
+/// shared between replicas. Behind a load balancer with N replicas each replica
+/// rebuilds every `store: false` alias for itself, and a client can get a
+/// manifest cache hit on one replica and then a 404 `BLOB_UNKNOWN` when the
+/// follow-up blob request lands on another that never built that chart. Run a
+/// single replica for `store: false` aliases, or give the alias a persistent
+/// object store.
 pub struct EphemeralStorage {
     cache: moka::future::Cache<String, Entry>,
 }
@@ -88,8 +97,8 @@ impl Storage for EphemeralStorage {
         tag: &str,
         ptr: &TagPointer,
     ) -> Result<(), StorageError> {
-        let data =
-            serde_json::to_vec(ptr).map_err(|error| StorageError::Backend(error.to_string()))?;
+        let data = serde_json::to_vec(ptr)
+            .map_err(|error| StorageError::backend(StorageOp::TagWrite, error))?;
         let entry = Entry {
             content_type: "application/json".to_string(),
             data: data.into(),

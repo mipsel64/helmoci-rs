@@ -5,7 +5,7 @@ use helmoci_core::resolver::{
 };
 use helmoci_storage::{ObjectStoreStorage, Storage};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 const MAX_CACHE_TTL_SECS: u64 = 1_000 * 365 * 24 * 60 * 60;
@@ -16,6 +16,14 @@ fn default_listen() -> String {
 
 fn default_max_chart_bytes() -> u64 {
     50 * 1024 * 1024
+}
+
+fn default_max_expanded_chart_bytes() -> u64 {
+    500 * 1024 * 1024
+}
+
+fn default_max_index_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 fn default_index_ttl() -> u64 {
@@ -37,6 +45,12 @@ pub struct Config {
     pub listen: String,
     #[serde(default = "default_max_chart_bytes")]
     pub max_chart_bytes: u64,
+    /// Cap on the uncompressed size of an expanded chart archive.
+    #[serde(default = "default_max_expanded_chart_bytes")]
+    pub max_expanded_chart_bytes: u64,
+    /// Cap on a downloaded classic `index.yaml`, independent of chart size.
+    #[serde(default = "default_max_index_bytes")]
+    pub max_index_bytes: u64,
     #[serde(default = "default_index_ttl")]
     pub index_cache_ttl_secs: u64,
     #[serde(default)]
@@ -44,6 +58,9 @@ pub struct Config {
     pub storage: Backend,
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Unsafe opt-in: serve aliases that authenticate upstream to anonymous clients.
+    #[serde(default)]
+    pub allow_public_private_upstreams: bool,
     #[serde(default)]
     pub aliases: HashMap<String, AliasConfig>,
 }
@@ -130,16 +147,17 @@ pub struct RuntimeConfig {
     pub classic_alias_by_repo: HashMap<String, String>,
 }
 
-fn env_context(name: &str) -> Result<Option<String>, std::env::VarError> {
-    match std::env::var(name) {
-        Ok(value) => Ok(Some(value)),
-        Err(_) => Ok(None),
-    }
-}
-
 pub fn parse_config(raw_yaml: &str) -> eyre::Result<RuntimeConfig> {
+    let mut missing_vars = BTreeSet::new();
     let expanded =
-        shellexpand::env_with_context(raw_yaml, env_context).wrap_err("expanding configuration")?;
+        shellexpand::env_with_context(raw_yaml, |name: &str| match std::env::var(name) {
+            Ok(value) => Ok::<_, std::env::VarError>(Some(value)),
+            Err(_) => {
+                missing_vars.insert(name.to_string());
+                Ok(None)
+            }
+        })
+        .wrap_err("expanding configuration")?;
     let settings = config::Config::builder()
         .add_source(config::File::from_str(
             expanded.as_ref(),
@@ -149,7 +167,7 @@ pub fn parse_config(raw_yaml: &str) -> eyre::Result<RuntimeConfig> {
         .wrap_err("building configuration")?
         .try_deserialize::<Config>()
         .wrap_err("deserializing configuration")?;
-    validate(settings)
+    validate(settings, &missing_vars)
 }
 
 pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
@@ -158,15 +176,98 @@ pub fn load_config(path: &str) -> eyre::Result<RuntimeConfig> {
     parse_config(&raw).wrap_err_with(|| format!("loading config file {path}"))
 }
 
-fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
+/// True when `value` still carries a `${var}` or `$var` reference shellexpand left in place.
+fn references_missing_var(value: &str, var: &str) -> bool {
+    if value.contains(&format!("${{{var}}}")) {
+        return true;
+    }
+    let bare = format!("${var}");
+    value.match_indices(&bare).any(|(index, _)| {
+        value[index + bare.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !(next.is_alphanumeric() || next == '_'))
+    })
+}
+
+/// Secrets must never fall back to their literal `${VAR}` text.
+fn reject_unexpanded_secret(
+    field: &str,
+    value: &str,
+    missing_vars: &BTreeSet<String>,
+) -> eyre::Result<()> {
+    for var in missing_vars {
+        if references_missing_var(value, var) {
+            bail!(
+                "{field} still references environment variable {var}, which is not set: \
+                 helmoci refuses to use the literal reference as a credential. \
+                 Set {var} before starting helmoci."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate(settings: Config, missing_vars: &BTreeSet<String>) -> eyre::Result<RuntimeConfig> {
     if settings.index_cache_ttl_secs > MAX_CACHE_TTL_SECS {
         bail!("index_cache_ttl_secs must not exceed {MAX_CACHE_TTL_SECS} seconds (1000 years)");
     }
     if settings.ephemeral_cache.ttl_secs > MAX_CACHE_TTL_SECS {
         bail!("ephemeral_cache.ttl_secs must not exceed {MAX_CACHE_TTL_SECS} seconds (1000 years)");
     }
+    if settings.max_expanded_chart_bytes == 0 {
+        bail!("max_expanded_chart_bytes must be greater than zero");
+    }
+    if settings.max_expanded_chart_bytes < settings.max_chart_bytes {
+        bail!(
+            "max_expanded_chart_bytes ({}) must be at least max_chart_bytes ({}): \
+             charts expand to more bytes than they download as",
+            settings.max_expanded_chart_bytes,
+            settings.max_chart_bytes
+        );
+    }
+    if settings.max_index_bytes == 0 {
+        bail!("max_index_bytes must be greater than zero");
+    }
+    if settings.ephemeral_cache.max_bytes < settings.max_chart_bytes {
+        bail!(
+            "ephemeral_cache.max_bytes ({}) must hold at least one max_chart_bytes ({}) artifact, \
+             otherwise nothing is ever retained and every pull rebuilds the chart",
+            settings.ephemeral_cache.max_bytes,
+            settings.max_chart_bytes
+        );
+    }
     if settings.auth.enabled && !settings.auth.tokens.iter().any(|token| !token.is_empty()) {
         bail!("auth.enabled is true but auth.tokens has no non-empty token");
+    }
+    if !missing_vars.is_empty() {
+        for (index, token) in settings.auth.tokens.iter().enumerate() {
+            reject_unexpanded_secret(&format!("auth.tokens[{index}]"), token, missing_vars)?;
+        }
+        match &settings.storage {
+            Backend::R2(r2) => {
+                reject_unexpanded_secret(
+                    "storage.settings.access_key_id",
+                    &r2.access_key_id,
+                    missing_vars,
+                )?;
+                reject_unexpanded_secret(
+                    "storage.settings.secret_access_key",
+                    &r2.secret_access_key,
+                    missing_vars,
+                )?;
+            }
+            Backend::Gcs(gcs) => {
+                if let Some(key) = &gcs.service_account_key {
+                    reject_unexpanded_secret(
+                        "storage.settings.service_account_key",
+                        key,
+                        missing_vars,
+                    )?;
+                }
+            }
+            Backend::Local(_) | Backend::Memory => {}
+        }
     }
 
     let mut aliases = HashMap::new();
@@ -191,6 +292,25 @@ fn validate(settings: Config) -> eyre::Result<RuntimeConfig> {
             },
         );
     }
+    if !settings.auth.enabled && !settings.allow_public_private_upstreams {
+        let mut credentialed: Vec<&str> = aliases
+            .iter()
+            .filter(|(_, alias)| !matches!(alias.auth, UpstreamAuthKind::None))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        credentialed.sort_unstable();
+        if !credentialed.is_empty() {
+            bail!(
+                "aliases [{}] authenticate to their upstream while auth.enabled is false: \
+                 helmoci holds those upstream credentials, so it would republish private \
+                 upstream content to anonymous clients. Enable auth.enabled with at least one \
+                 auth.tokens entry, or set allow_public_private_upstreams: true to accept that \
+                 (unsafe: only for mirroring private charts onto a trusted network).",
+                credentialed.join(", ")
+            );
+        }
+    }
+
     let classic_alias_by_repo = classic_alias_rewrite_map(&aliases);
     Ok(RuntimeConfig {
         settings,
@@ -397,11 +517,205 @@ mod tests {
         let _lock = env_lock();
         let _env = EnvGuard::new(&["HELMOCI_TEST_MISSING"]);
         let cfg = parse_config(concat!(
-            "storage:\n  type: memory\n",
-            "auth:\n  tokens: [\"${HELMOCI_TEST_MISSING}\"]\n",
+            "storage:\n  type: local\n  settings:\n",
+            "    path: /tmp/${HELMOCI_TEST_MISSING}\n",
         ))
         .unwrap();
-        assert_eq!(cfg.settings.auth.tokens, ["${HELMOCI_TEST_MISSING}"]);
+        let Backend::Local(local) = cfg.settings.storage else {
+            panic!("expected local backend")
+        };
+        assert_eq!(local.path, "/tmp/${HELMOCI_TEST_MISSING}");
+    }
+
+    #[test]
+    fn rejects_unexpanded_references_in_secret_fields() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new(&["HELMOCI_TEST_MISSING"]);
+        for (yaml, field) in [
+            (
+                concat!(
+                    "storage:\n  type: memory\n",
+                    "auth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_MISSING}\"]\n",
+                ),
+                "auth.tokens[0]",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: memory\n",
+                    "auth:\n  tokens: [\"good\", \"$HELMOCI_TEST_MISSING\"]\n",
+                ),
+                "auth.tokens[1]",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: r2\n  settings:\n",
+                    "    endpoint: https://r2.example\n    bucket: charts\n",
+                    "    access_key_id: ${HELMOCI_TEST_MISSING}\n    secret_access_key: secret\n",
+                ),
+                "storage.settings.access_key_id",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: r2\n  settings:\n",
+                    "    endpoint: https://r2.example\n    bucket: charts\n",
+                    "    access_key_id: key\n    secret_access_key: ${HELMOCI_TEST_MISSING}\n",
+                ),
+                "storage.settings.secret_access_key",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: gcs\n  settings:\n",
+                    "    bucket: charts\n    service_account_key: ${HELMOCI_TEST_MISSING}\n",
+                ),
+                "storage.settings.service_account_key",
+            ),
+        ] {
+            let error = match parse_config(yaml) {
+                Ok(_) => panic!("unexpectedly accepted unexpanded secret:\n{yaml}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{error}");
+            assert!(error.contains("HELMOCI_TEST_MISSING"), "{error}");
+        }
+    }
+
+    #[test]
+    fn secrets_from_the_environment_may_contain_dollar_signs() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&["HELMOCI_TEST_TOKEN", "HELMOCI_TEST_MISSING"]);
+        env.set("HELMOCI_TEST_TOKEN", "ab$Cd${Ef}");
+        let cfg = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "auth:\n  enabled: true\n  tokens: [\"${HELMOCI_TEST_TOKEN}\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings.auth.tokens, ["ab$Cd${Ef}"]);
+    }
+
+    #[test]
+    fn accepts_secret_values_without_environment_references() {
+        let cfg = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "auth:\n  enabled: true\n  tokens: [\"literal-token\", \"pa$$-and-100$\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings.auth.tokens.len(), 2);
+    }
+
+    #[test]
+    fn new_size_limits_expose_documented_defaults() {
+        let rc = parse_config(MINIMAL).unwrap();
+        assert_eq!(rc.settings.max_expanded_chart_bytes, 524_288_000);
+        assert_eq!(rc.settings.max_index_bytes, 67_108_864);
+    }
+
+    #[test]
+    fn rejects_unusable_size_limits() {
+        for (yaml, field) in [
+            (
+                "storage:\n  type: memory\nmax_expanded_chart_bytes: 0\n",
+                "max_expanded_chart_bytes",
+            ),
+            (
+                "storage:\n  type: memory\nmax_index_bytes: 0\n",
+                "max_index_bytes",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: memory\n",
+                    "max_chart_bytes: 1048576\nmax_expanded_chart_bytes: 1048575\n",
+                ),
+                "max_expanded_chart_bytes",
+            ),
+            (
+                concat!(
+                    "storage:\n  type: memory\n",
+                    "max_chart_bytes: 1048576\nephemeral_cache:\n  max_bytes: 1048575\n",
+                ),
+                "ephemeral_cache.max_bytes",
+            ),
+        ] {
+            let error = match parse_config(yaml) {
+                Ok(_) => panic!("unexpectedly accepted:\n{yaml}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn accepts_size_limits_at_their_lower_bounds() {
+        let rc = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "max_chart_bytes: 1048576\nmax_expanded_chart_bytes: 1048576\n",
+            "max_index_bytes: 1\nephemeral_cache:\n  max_bytes: 1048576\n",
+        ))
+        .unwrap();
+        assert_eq!(rc.settings.max_expanded_chart_bytes, 1_048_576);
+        assert_eq!(rc.settings.max_index_bytes, 1);
+        assert_eq!(rc.settings.ephemeral_cache.max_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn rejects_credentialed_upstream_alias_when_pull_auth_is_disabled() {
+        let error = match parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "aliases:\n",
+            "  acme:\n    upstream: oci://asia-docker.pkg.dev/example-project/charts\n    auth: gcp\n",
+        )) {
+            Ok(_) => panic!("expected a credentialed alias without pull auth to be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("acme"), "{message}");
+        assert!(message.contains("auth.enabled"), "{message}");
+        assert!(
+            message.contains("allow_public_private_upstreams"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn accepts_credentialed_upstream_alias_with_pull_auth_enabled() {
+        let rc = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "auth:\n  enabled: true\n  tokens: [\"sekrit\"]\n",
+            "aliases:\n",
+            "  acme:\n    upstream: oci://asia-docker.pkg.dev/example-project/charts\n    auth: gcp\n",
+        ))
+        .unwrap();
+        assert_eq!(rc.aliases["acme"].auth, UpstreamAuthKind::Gcp);
+    }
+
+    #[test]
+    fn accepts_credentialed_upstream_alias_with_explicit_public_opt_in() {
+        let rc = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "allow_public_private_upstreams: true\n",
+            "aliases:\n",
+            "  acme:\n    upstream: oci://asia-docker.pkg.dev/example-project/charts\n    auth: gcp\n",
+        ))
+        .unwrap();
+        assert!(rc.settings.allow_public_private_upstreams);
+        assert_eq!(rc.aliases["acme"].auth, UpstreamAuthKind::Gcp);
+    }
+
+    #[test]
+    fn anonymous_upstream_aliases_do_not_require_pull_auth() {
+        let rc = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "aliases:\n",
+            "  public:\n    upstream: oci://registry.example.com/team/charts\n",
+        ))
+        .unwrap();
+        assert_eq!(rc.aliases["public"].auth, UpstreamAuthKind::None);
+    }
+
+    #[test]
+    fn bundled_example_config_parses() {
+        let rc = parse_config(include_str!("../../../examples/config.yaml")).unwrap();
+        assert!(rc.aliases.contains_key("argo"));
     }
 
     #[test]
@@ -442,13 +756,14 @@ mod tests {
     fn builds_alias_tables() {
         let yaml = concat!(
             "storage:\n  type: memory\n",
+            "auth:\n  enabled: true\n  tokens: [\"sekrit\"]\n",
             "aliases:\n",
             "  argo:\n    upstream: https://argoproj.github.io/argo-helm\n    store: true\n",
-            "  meteora:\n    upstream: oci://asia-docker.pkg.dev/meteora-ops/charts\n    auth: gcp\n",
+            "  acme:\n    upstream: oci://asia-docker.pkg.dev/example-project/charts\n    auth: gcp\n",
         );
         let rc = parse_config(yaml).unwrap();
         assert_eq!(rc.aliases.len(), 2);
-        assert!(!rc.aliases["meteora"].store);
+        assert!(!rc.aliases["acme"].store);
         assert_eq!(
             rc.classic_alias_by_repo.get("argoproj.github.io/argo-helm"),
             Some(&"argo".to_string())
