@@ -94,6 +94,7 @@ impl AppState {
         gcp: Option<Arc<dyn crate::gcp::GcpTokenProvider>>,
     ) -> eyre::Result<SharedState> {
         let http = reqwest::Client::builder()
+            .user_agent(helmoci_info::user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -227,6 +228,7 @@ impl Resolve for SystemDnsResolver {
 
 fn build_no_redirect_http<R: Resolve + 'static>(resolver: R) -> eyre::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .user_agent(helmoci_info::user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
         .no_proxy()

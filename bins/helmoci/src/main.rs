@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(
     name = "helmoci",
+    version = helmoci_info::version(),
     about = "Classic Helm chart repositories served as an OCI registry"
 )]
 struct Args {

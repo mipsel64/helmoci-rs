@@ -1,0 +1,7 @@
+[package]
+name = "helmoci-info"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+const_format.workspace = true
