@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 helmoci-core.workspace = true
+helmoci-info.workspace = true
 helmoci-storage.workspace = true
 eyre.workspace = true
 async-trait.workspace = true

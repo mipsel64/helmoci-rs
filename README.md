@@ -156,6 +156,16 @@ Before `config-rs` deserializes the selected YAML file, `shellexpand` expands `$
 
 Expansion applies to the whole document, so a literal `$` in a config file has shell semantics: `$NAME` and `${NAME}` are substituted from the server environment and `$$` collapses to a single `$`. Keep literal `$` out of values written into the file and pass such values through an environment variable instead, because values substituted from the environment are inserted as-is and are never re-expanded.
 
+### Version and build provenance
+
+`helmoci --version` (or `-V`) reports the crate version with the commit and build timestamp:
+
+```console
+helmoci 0.1.0 (commit: 54f7717d0b8f2c1a9e3b4d5f6a7b8c9d0e1f2a3b) built on 2026-08-06T12:00:00Z
+```
+
+The commit and timestamp are read from the `GIT_SHA` and `BUILD_TIME` environment variables at compile time and baked into the binary; the release workflow passes them as Docker build arguments. A plain `cargo build` leaves both unset, and each field then reads `unknown` rather than failing the build. The same values identify helmoci to upstream repositories and registries through a `helmoci/<version>-<short sha>` `User-Agent`.
+
 ## Pull authentication
 
 Pull authentication is disabled by default. To enable it without writing a token directly into the file, set `HELMOCI_PULL_TOKEN` and add:
