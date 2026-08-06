@@ -13,7 +13,7 @@ What this port extends:
 | Extension | Original | This port |
 | --- | --- | --- |
 | Runtime | Cloudflare Worker | Standalone server (axum/tokio), shipped as a distroless container |
-| Storage | R2 only | Pluggable `Storage` trait: R2 (S3-compatible), GCS, local filesystem, in-memory, plus a bounded in-process ephemeral cache |
+| Storage | R2 only | Pluggable `Storage` trait: S3 (AWS S3, Cloudflare R2, MinIO, and other S3-compatible services), GCS, local filesystem, in-memory, plus a bounded in-process ephemeral cache |
 | Aliases | — | Short names mapping to either a classic Helm repo or an upstream OCI registry |
 | OCI pass-through | — | Proxies an upstream `/v2` API with the Docker token flow, optional write-through caching, and Google Artifact Registry support via Application Default Credentials |
 | Pull authentication | — | Optional static tokens, accepted as Basic or Bearer, compared in constant time |
@@ -93,17 +93,33 @@ storage:
     path: /var/lib/helmoci
 ```
 
-Cloudflare R2 uses the S3-compatible API and requires all four settings:
+The `s3` backend covers AWS S3 and any S3-compatible service, including Cloudflare R2, MinIO, and Ceph. `bucket`, `access_key_id`, and `secret_access_key` are always required; `endpoint` and `region` select the service.
+
+For AWS S3, give the `region` and omit `endpoint` — the endpoint is derived from the region and buckets are addressed virtual-hosted style:
 
 ```yaml
 storage:
-  type: r2
+  type: s3
+  settings:
+    bucket: helmoci-cache
+    region: ap-southeast-1
+    access_key_id: ${AWS_ACCESS_KEY_ID}
+    secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+```
+
+For an S3-compatible service, give the `endpoint`. Buckets are then addressed path-style, and `region` defaults to `auto`, which is what Cloudflare R2 signs with:
+
+```yaml
+storage:
+  type: s3
   settings:
     endpoint: https://example-account.r2.cloudflarestorage.com
     bucket: helmoci-cache
     access_key_id: ${R2_ACCESS_KEY_ID}
     secret_access_key: ${R2_SECRET_ACCESS_KEY}
 ```
+
+Services that validate the signing region, such as MinIO, need `region` set explicitly alongside `endpoint`. Omitting both `endpoint` and `region` is rejected at startup.
 
 Google Cloud Storage requires `bucket`. `service_account_key` is optional; when present it is a path to a service-account key file, and when omitted the object-store client loads its supported GCS environment credentials.
 
@@ -115,7 +131,7 @@ storage:
     service_account_key: /run/secrets/gcs-service-account.json
 ```
 
-R2 and GCS credentials belong to the storage backend. They are separate from an OCI alias using `auth: gcp`, which obtains Google Application Default Credentials (ADC) for upstream registry requests.
+S3 and GCS credentials belong to the storage backend. They are separate from an OCI alias using `auth: gcp`, which obtains Google Application Default Credentials (ADC) for upstream registry requests.
 
 ### Aliases
 

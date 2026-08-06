@@ -11,7 +11,7 @@ use std::sync::Arc;
 /// not one, so it is rejected instead of being buffered into memory.
 const MAX_TAG_POINTER_BYTES: usize = 8 * 1024;
 
-/// One implementation for every object_store backend: R2 (S3), GCS, local fs, memory.
+/// One implementation for every object_store backend: S3, GCS, local fs, memory.
 #[derive(Clone)]
 pub struct ObjectStoreStorage {
     store: Arc<dyn ObjectStore>,

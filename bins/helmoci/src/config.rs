@@ -10,6 +10,9 @@ use std::sync::Arc;
 
 const MAX_CACHE_TTL_SECS: u64 = 1_000 * 365 * 24 * 60 * 60;
 
+/// Cloudflare R2 signs with this region; other endpoints can override it.
+const DEFAULT_S3_REGION: &str = "auto";
+
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
@@ -91,17 +94,23 @@ impl Default for EphemeralCacheConfig {
     deny_unknown_fields
 )]
 pub enum Backend {
-    R2(R2Config),
+    S3(S3Config),
     Gcs(GcsConfig),
     Local(LocalConfig),
     Memory,
 }
 
+/// Any S3-compatible object store: AWS S3 itself, Cloudflare R2, MinIO, Ceph.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct R2Config {
-    pub endpoint: String,
+pub struct S3Config {
+    /// Service endpoint. Omit for AWS S3, which is derived from `region`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
     pub bucket: String,
+    /// Defaults to R2's `auto`; required when `endpoint` is omitted.
+    #[serde(default)]
+    pub region: Option<String>,
     pub access_key_id: String,
     pub secret_access_key: String,
 }
@@ -240,20 +249,29 @@ fn validate(settings: Config, missing_vars: &BTreeSet<String>) -> eyre::Result<R
     if settings.auth.enabled && !settings.auth.tokens.iter().any(|token| !token.is_empty()) {
         bail!("auth.enabled is true but auth.tokens has no non-empty token");
     }
+    if let Backend::S3(s3) = &settings.storage
+        && s3.endpoint.is_none()
+        && s3.region.is_none()
+    {
+        bail!(
+            "storage.settings needs either region (AWS S3, whose endpoint is derived from it) \
+             or endpoint (an S3-compatible service such as Cloudflare R2 or MinIO)"
+        );
+    }
     if !missing_vars.is_empty() {
         for (index, token) in settings.auth.tokens.iter().enumerate() {
             reject_unexpanded_secret(&format!("auth.tokens[{index}]"), token, missing_vars)?;
         }
         match &settings.storage {
-            Backend::R2(r2) => {
+            Backend::S3(s3) => {
                 reject_unexpanded_secret(
                     "storage.settings.access_key_id",
-                    &r2.access_key_id,
+                    &s3.access_key_id,
                     missing_vars,
                 )?;
                 reject_unexpanded_secret(
                     "storage.settings.secret_access_key",
-                    &r2.secret_access_key,
+                    &s3.secret_access_key,
                     missing_vars,
                 )?;
             }
@@ -326,16 +344,20 @@ pub fn build_storage(cfg: &Backend) -> eyre::Result<Arc<dyn Storage>> {
     use object_store::memory::InMemory;
 
     let store: Arc<dyn object_store::ObjectStore> = match cfg {
-        Backend::R2(r2) => Arc::new(
-            AmazonS3Builder::new()
-                .with_endpoint(&r2.endpoint)
-                .with_bucket_name(&r2.bucket)
-                .with_access_key_id(&r2.access_key_id)
-                .with_secret_access_key(&r2.secret_access_key)
-                .with_region("auto")
-                .build()
-                .wrap_err("building R2 (S3) client")?,
-        ),
+        Backend::S3(s3) => {
+            let builder = AmazonS3Builder::new()
+                .with_bucket_name(&s3.bucket)
+                .with_access_key_id(&s3.access_key_id)
+                .with_secret_access_key(&s3.secret_access_key)
+                .with_region(s3.region.as_deref().unwrap_or(DEFAULT_S3_REGION));
+            // A configured endpoint addresses buckets path-style, which is what R2 and
+            // MinIO expect; AWS S3 itself is addressed virtual-hosted style.
+            let builder = match &s3.endpoint {
+                Some(endpoint) => builder.with_endpoint(endpoint),
+                None => builder.with_virtual_hosted_style_request(true),
+            };
+            Arc::new(builder.build().wrap_err("building S3 client")?)
+        }
         Backend::Gcs(gcs) => {
             let mut builder = GoogleCloudStorageBuilder::from_env().with_bucket_name(&gcs.bucket);
             if let Some(key) = &gcs.service_account_key {
@@ -413,12 +435,19 @@ mod tests {
         assert_eq!(local.path, "/tmp/helmoci");
 
         let r2 = parse_config(concat!(
-            "storage:\n  type: r2\n  settings:\n",
-            "    endpoint: https://r2.example\n    bucket: charts\n",
+            "storage:\n  type: s3\n  settings:\n",
+            "    endpoint: https://acct.r2.cloudflarestorage.com\n    bucket: charts\n",
             "    access_key_id: key\n    secret_access_key: secret\n",
         ))
         .unwrap();
-        assert!(matches!(r2.settings.storage, Backend::R2(_)));
+        let Backend::S3(r2) = r2.settings.storage else {
+            panic!("expected s3 backend")
+        };
+        assert_eq!(
+            r2.endpoint.as_deref(),
+            Some("https://acct.r2.cloudflarestorage.com")
+        );
+        assert_eq!(r2.region, None);
 
         let gcs = parse_config(concat!(
             "storage:\n  type: gcs\n  settings:\n",
@@ -426,6 +455,37 @@ mod tests {
         ))
         .unwrap();
         assert!(matches!(gcs.settings.storage, Backend::Gcs(_)));
+    }
+
+    #[test]
+    fn s3_accepts_a_region_without_an_endpoint() {
+        let cfg = parse_config(concat!(
+            "storage:\n  type: s3\n  settings:\n",
+            "    bucket: charts\n    region: ap-southeast-1\n",
+            "    access_key_id: key\n    secret_access_key: secret\n",
+        ))
+        .unwrap();
+        let Backend::S3(s3) = cfg.settings.storage else {
+            panic!("expected s3 backend")
+        };
+        assert_eq!(s3.endpoint, None);
+        assert_eq!(s3.region.as_deref(), Some("ap-southeast-1"));
+    }
+
+    #[test]
+    fn s3_rejects_omitting_both_endpoint_and_region() {
+        let error = match parse_config(concat!(
+            "storage:\n  type: s3\n  settings:\n",
+            "    bucket: charts\n",
+            "    access_key_id: key\n    secret_access_key: secret\n",
+        )) {
+            Ok(_) => panic!("expected an s3 backend without endpoint or region to be rejected"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("region"), "{message}");
+        assert!(message.contains("endpoint"), "{message}");
     }
 
     #[test]
@@ -548,16 +608,16 @@ mod tests {
             ),
             (
                 concat!(
-                    "storage:\n  type: r2\n  settings:\n",
-                    "    endpoint: https://r2.example\n    bucket: charts\n",
+                    "storage:\n  type: s3\n  settings:\n",
+                    "    endpoint: https://s3.example\n    bucket: charts\n",
                     "    access_key_id: ${HELMOCI_TEST_MISSING}\n    secret_access_key: secret\n",
                 ),
                 "storage.settings.access_key_id",
             ),
             (
                 concat!(
-                    "storage:\n  type: r2\n  settings:\n",
-                    "    endpoint: https://r2.example\n    bucket: charts\n",
+                    "storage:\n  type: s3\n  settings:\n",
+                    "    endpoint: https://s3.example\n    bucket: charts\n",
                     "    access_key_id: key\n    secret_access_key: ${HELMOCI_TEST_MISSING}\n",
                 ),
                 "storage.settings.secret_access_key",
@@ -738,7 +798,7 @@ mod tests {
     #[test]
     fn rejects_unknown_fields_and_bad_config() {
         assert!(parse_config("storage:\n  type: memory\ntypo_field: 1\n").is_err());
-        assert!(parse_config("storage:\n  type: r2\n").is_err());
+        assert!(parse_config("storage:\n  type: s3\n").is_err());
         assert!(
             parse_config(
                 "storage:\n  type: memory\naliases:\n  bad.name:\n    upstream: https://x.io\n"
