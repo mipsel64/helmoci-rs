@@ -1,5 +1,10 @@
 listen: 0.0.0.0:8080
 
+# Logging (defaults shown). LOG_LEVEL, RUST_LOG, and LOG_FORMAT override these.
+# log:
+#   level: info
+#   format: compact
+
 storage:
   type: local
   settings:

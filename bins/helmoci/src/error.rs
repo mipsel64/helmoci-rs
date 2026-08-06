@@ -208,7 +208,7 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer_output = output.clone();
         let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+            .with_max_level(tracing::Level::WARN)
             .with_ansi(false)
             .with_writer(move || SharedWriter(writer_output.clone()))
             .finish();

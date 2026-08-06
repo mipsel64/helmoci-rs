@@ -36,6 +36,7 @@ url.workspace = true
 [dev-dependencies]
 helmoci-core = { workspace = true, features = ["test-util"] }
 http-body-util.workspace = true
+log.workspace = true
 tar.workspace = true
 flate2.workspace = true
 tempfile.workspace = true

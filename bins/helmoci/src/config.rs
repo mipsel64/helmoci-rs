@@ -6,7 +6,11 @@ use helmoci_core::resolver::{
 use helmoci_storage::{ObjectStoreStorage, Storage};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
 use std::sync::Arc;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::filter::Targets;
+use tracing_subscriber::layer::SubscriberExt;
 
 const MAX_CACHE_TTL_SECS: u64 = 1_000 * 365 * 24 * 60 * 60;
 
@@ -46,6 +50,8 @@ fn default_ephemeral_ttl() -> u64 {
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
+    #[serde(default)]
+    pub log: Logging,
     #[serde(default = "default_max_chart_bytes")]
     pub max_chart_bytes: u64,
     /// Cap on the uncompressed size of an expanded chart archive.
@@ -84,6 +90,25 @@ impl Default for EphemeralCacheConfig {
             ttl_secs: default_ephemeral_ttl(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Logging {
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub format: Option<LogFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    #[default]
+    Compact,
+    Full,
+    Json,
+    Pretty,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +398,95 @@ pub fn build_storage(cfg: &Backend) -> eyre::Result<Arc<dyn Storage>> {
         Backend::Memory => Arc::new(InMemory::new()),
     };
     Ok(Arc::new(ObjectStoreStorage::new(store)))
+}
+
+/// Installs the process-wide subscriber. Callable once; a second call fails.
+pub fn init_logging(config: &Logging) -> eyre::Result<()> {
+    let subscriber = tracing_subscriber::registry().with(resolve_targets(config));
+    let fmt = tracing_subscriber::fmt::layer().with_line_number(true);
+
+    match resolve_format(config) {
+        LogFormat::Full => tracing::subscriber::set_global_default(subscriber.with(fmt)),
+        LogFormat::Json => tracing::subscriber::set_global_default(subscriber.with(fmt.json())),
+        LogFormat::Pretty => tracing::subscriber::set_global_default(subscriber.with(fmt.pretty())),
+        LogFormat::Compact => {
+            tracing::subscriber::set_global_default(subscriber.with(fmt.compact()))
+        }
+    }
+    .wrap_err("installing the global tracing subscriber")?;
+
+    Ok(())
+}
+
+/// `LOG_LEVEL`, then `RUST_LOG`, then the config file: the environment outranks
+/// mounted YAML so verbosity can be raised on a running container without a redeploy.
+/// An unparseable source is reported and skipped rather than silencing the process.
+fn resolve_targets(config: &Logging) -> Targets {
+    let sources = [
+        env_override("LOG_LEVEL"),
+        env_override("RUST_LOG"),
+        config.level.as_deref().and_then(non_empty),
+    ];
+    for spec in sources.into_iter().flatten() {
+        match parse_targets(&spec) {
+            Ok(targets) => return targets,
+            Err(e) => eprintln!("helmoci: ignoring unusable log level {spec:?}: {e}"),
+        }
+    }
+    default_targets()
+}
+
+/// A bare single word is only ever meant as a global level, so it has to parse as one.
+/// `Targets` would otherwise read `infoo` as "target `infoo` at trace, everything else
+/// off" and silence the process on a typo. Specs containing `=` or `,` are real
+/// directive lists and keep their usual `RUST_LOG` meaning, including the deliberate
+/// `helmoci=debug` form that leaves every other target off.
+fn parse_targets(spec: &str) -> Result<Targets, String> {
+    if !spec.contains(['=', ',']) {
+        return LevelFilter::from_str(spec)
+            .map(|level| Targets::new().with_default(level))
+            .map_err(|_| "expected a level such as off, warn, info, debug or trace".to_string());
+    }
+    Targets::from_str(spec).map_err(|e| e.to_string())
+}
+
+fn resolve_format(config: &Logging) -> LogFormat {
+    let configured = config.format.unwrap_or_default();
+    match env_override("LOG_FORMAT") {
+        Some(raw) => raw.parse().unwrap_or_else(|()| {
+            eprintln!("helmoci: ignoring unknown log format {raw:?}, using {configured:?}");
+            configured
+        }),
+        None => configured,
+    }
+}
+
+fn default_targets() -> Targets {
+    Targets::new().with_default(tracing::Level::INFO)
+}
+
+/// A blank env var reads as unset: an unsubstituted value in a container manifest
+/// means "not configured", never "disable all logging".
+fn env_override(key: &str) -> Option<String> {
+    non_empty(&std::env::var(key).ok()?)
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+impl std::str::FromStr for LogFormat {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" => Ok(LogFormat::Compact),
+            "full" => Ok(LogFormat::Full),
+            "json" => Ok(LogFormat::Json),
+            "pretty" => Ok(LogFormat::Pretty),
+            _ => Err(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -828,5 +942,165 @@ mod tests {
             rc.classic_alias_by_repo.get("argoproj.github.io/argo-helm"),
             Some(&"argo".to_string())
         );
+    }
+
+    const LOG_VARS: [&str; 3] = ["LOG_LEVEL", "RUST_LOG", "LOG_FORMAT"];
+
+    fn logging(level: Option<&str>, format: Option<LogFormat>) -> Logging {
+        Logging {
+            level: level.map(str::to_string),
+            format,
+        }
+    }
+
+    #[test]
+    fn the_environment_outranks_the_config_file_log_level() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&LOG_VARS);
+        let configured = logging(Some("error"), None);
+
+        assert_eq!(
+            resolve_targets(&configured).default_level(),
+            Some(LevelFilter::ERROR),
+            "with no environment set, the config file decides"
+        );
+
+        env.set("RUST_LOG", "warn");
+        assert_eq!(
+            resolve_targets(&configured).default_level(),
+            Some(LevelFilter::WARN),
+            "RUST_LOG must override mounted YAML so verbosity is reachable without a redeploy"
+        );
+
+        env.set("LOG_LEVEL", "debug");
+        assert_eq!(
+            resolve_targets(&configured).default_level(),
+            Some(LevelFilter::DEBUG),
+            "LOG_LEVEL is the primary knob and outranks RUST_LOG"
+        );
+    }
+
+    #[test]
+    fn logging_defaults_to_info_when_nothing_is_configured() {
+        let _lock = env_lock();
+        let _env = EnvGuard::new(&LOG_VARS);
+        assert_eq!(
+            resolve_targets(&Logging::default()).default_level(),
+            Some(LevelFilter::INFO)
+        );
+    }
+
+    #[test]
+    fn an_unusable_level_falls_back_instead_of_silencing_the_process() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&LOG_VARS);
+
+        // The failure guarded against here is silence, not noise. Both spellings of a
+        // bad level used to end in a `Targets` with no default level, which drops every
+        // event: `helmoci=notalevel` through `unwrap_or_default` on a parse error, and
+        // a bare `infoo` by parsing cleanly into "target `infoo` at trace, rest off".
+        for bad in ["infoo", "verbose-ish", "helmoci=notalevel"] {
+            env.set("LOG_LEVEL", bad);
+            assert_eq!(
+                resolve_targets(&Logging::default()).default_level(),
+                Some(LevelFilter::INFO),
+                "LOG_LEVEL={bad:?} must not turn logging off"
+            );
+            assert_eq!(
+                resolve_targets(&logging(Some("warn"), None)).default_level(),
+                Some(LevelFilter::WARN),
+                "LOG_LEVEL={bad:?} should fall through to the config file, not skip to info"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_environment_values_read_as_unset() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&LOG_VARS);
+        env.set("LOG_LEVEL", "   ");
+        env.set("LOG_FORMAT", "");
+        let configured = logging(Some("debug"), Some(LogFormat::Json));
+
+        assert_eq!(
+            resolve_targets(&configured).default_level(),
+            Some(LevelFilter::DEBUG),
+            "an unsubstituted env var means unconfigured, never 'disable logging'"
+        );
+        assert_eq!(resolve_format(&configured), LogFormat::Json);
+    }
+
+    #[test]
+    fn per_target_directives_keep_their_rust_log_meaning() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&LOG_VARS);
+
+        env.set("LOG_LEVEL", "warn,helmoci=debug");
+        let targets = resolve_targets(&Logging::default());
+        assert!(targets.would_enable("helmoci", &tracing::Level::DEBUG));
+        assert!(!targets.would_enable("reqwest", &tracing::Level::DEBUG));
+        assert!(targets.would_enable("reqwest", &tracing::Level::WARN));
+
+        // A lone directive deliberately leaves everything else off. Only bare words are
+        // treated as typos, so this keeps working exactly as it would under RUST_LOG.
+        env.set("LOG_LEVEL", "helmoci=debug");
+        let targets = resolve_targets(&Logging::default());
+        assert_eq!(targets.default_level(), None);
+        assert!(targets.would_enable("helmoci", &tracing::Level::DEBUG));
+        assert!(!targets.would_enable("reqwest", &tracing::Level::ERROR));
+
+        env.set("LOG_LEVEL", "off");
+        assert_eq!(
+            resolve_targets(&Logging::default()).default_level(),
+            Some(LevelFilter::OFF),
+            "silence must stay reachable on purpose"
+        );
+    }
+
+    #[test]
+    fn the_environment_outranks_the_config_file_log_format() {
+        let _lock = env_lock();
+        let env = EnvGuard::new(&LOG_VARS);
+        let configured = logging(None, Some(LogFormat::Json));
+
+        assert_eq!(resolve_format(&Logging::default()), LogFormat::Compact);
+        assert_eq!(resolve_format(&configured), LogFormat::Json);
+
+        env.set("LOG_FORMAT", "PRETTY");
+        assert_eq!(
+            resolve_format(&configured),
+            LogFormat::Pretty,
+            "format names are case-insensitive"
+        );
+
+        env.set("LOG_FORMAT", "yaml");
+        assert_eq!(
+            resolve_format(&configured),
+            LogFormat::Json,
+            "an unknown LOG_FORMAT keeps the configured format rather than resetting it"
+        );
+    }
+
+    #[test]
+    fn the_log_block_deserializes_and_rejects_unknown_keys() {
+        let cfg = parse_config(concat!(
+            "storage:\n  type: memory\n",
+            "log:\n  level: helmoci=debug\n  format: json\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.settings.log.level.as_deref(), Some("helmoci=debug"));
+        assert_eq!(cfg.settings.log.format, Some(LogFormat::Json));
+
+        assert_eq!(
+            parse_config(MINIMAL).unwrap().settings.log.format,
+            None,
+            "the log block is optional"
+        );
+
+        let typo = parse_config("storage:\n  type: memory\nlog:\n  fromat: json\n");
+        assert!(typo.is_err(), "a misspelled log key must not be ignored");
+
+        let bad_format = parse_config("storage:\n  type: memory\nlog:\n  format: yaml\n");
+        assert!(bad_format.is_err(), "unknown formats are rejected at load");
     }
 }

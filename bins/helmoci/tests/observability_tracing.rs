@@ -3,7 +3,6 @@ mod common;
 use axum::http::StatusCode;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::EnvFilter;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
@@ -95,10 +94,10 @@ async fn native_tracing_reports_token_redirect_and_cache_events_without_secrets(
     let output = Arc::new(Mutex::new(Vec::new()));
     let writer_output = output.clone();
     let subscriber = tracing_subscriber::fmt()
-        // Every target, not just helmoci's: the sentinel assertions below claim no
-        // URL reaches the logs, which a production `RUST_LOG=debug` would test
-        // against dependency events too.
-        .with_env_filter(EnvFilter::new("debug"))
+        // Every target at the loudest level helmoci can be run at: the sentinel
+        // assertions below claim no URL reaches the logs, so they have to hold
+        // against dependency events and the most verbose `LOG_LEVEL` alike.
+        .with_max_level(tracing::Level::TRACE)
         .with_ansi(false)
         .without_time()
         .with_target(false)
